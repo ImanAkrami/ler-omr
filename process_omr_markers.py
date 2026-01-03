@@ -42,6 +42,8 @@ def write_debug_image(image: np.ndarray, path: Path) -> None:
 
 def preprocess(gray: np.ndarray) -> Dict[str, np.ndarray]:
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Try adaptive threshold first
     binary = cv2.adaptiveThreshold(
         blurred,
         255,
@@ -55,7 +57,16 @@ def preprocess(gray: np.ndarray) -> Dict[str, np.ndarray]:
     k = int(max(7, min(KERNEL_MAX, THICK_K_FRAC * min_dim)))
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
     opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-    if cv2.countNonZero(opened) == 0:
+
+    # If too much was removed, try a more lenient approach
+    if cv2.countNonZero(opened) < cv2.countNonZero(binary) * 0.1:
+        # Try with smaller kernel
+        k_small = max(3, k // 2)
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (k_small, k_small))
+        opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_small)
+        if cv2.countNonZero(opened) == 0:
+            opened = binary  # fallback if everything was removed
+    elif cv2.countNonZero(opened) == 0:
         opened = binary  # fallback if everything was removed
 
     thick = cv2.dilate(opened, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
@@ -112,7 +123,9 @@ def component_score(mask: np.ndarray, corner: str) -> Tuple[float, float, float,
     v_density = float(np.count_nonzero(v_strip)) / float(v_strip.size)
     inner_density = float(np.count_nonzero(inner)) / float(inner.size) if inner.size > 0 else 0.0
 
-    if h_density < ARM_DENSITY_MIN or v_density < ARM_DENSITY_MIN or inner_density > INNER_DENSITY_MAX:
+    # More lenient thresholds for photographed images - allow lower densities
+    arm_density_threshold = ARM_DENSITY_MIN * 0.5  # Allow half the minimum for faint markers
+    if h_density < arm_density_threshold or v_density < arm_density_threshold or inner_density > INNER_DENSITY_MAX:
         return -1.0, h_density, v_density, inner_density
 
     score = (h_density + v_density) - inner_density - abs(fill_ratio - 0.2) * 0.2
@@ -166,6 +179,7 @@ def find_corner_in_roi(thick_mask: np.ndarray, roi: Tuple[int, int, int, int], c
     cv2.drawContours(color, contours, -1, (0, 0, 255), 2)
     write_debug_image(color, debug_dir / f"{stem}_roi_{corner}_comp.png")
 
+    # Try multiple methods to find the corner point
     edges = cv2.Canny(comp_mask_full, 50, 150)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=25, minLineLength=15, maxLineGap=8)
     horizontal_line: Optional[Tuple[int, int, int, int]] = None
@@ -185,17 +199,63 @@ def find_corner_in_roi(thick_mask: np.ndarray, roi: Tuple[int, int, int, int], c
     if horizontal_line is not None and vertical_line is not None:
         intersection = intersect_lines(horizontal_line, vertical_line)
 
-    if intersection is None:
-        ys, xs = np.nonzero(comp_mask_full)
-        if len(xs) == 0:
-            return None, component_debug
-        pts_global = np.stack([xs + rx, ys + ry], axis=1)
-        center_arr = np.array([[image_center[0], image_center[1]]], dtype=np.float32)
-        dists = np.linalg.norm(pts_global - center_arr, axis=1)
-        idx = int(np.argmin(dists))
-        point = (float(pts_global[idx, 0]), float(pts_global[idx, 1]))
-    else:
+    # If intersection found, use it; otherwise try contour-based corner detection
+    if intersection is not None:
         point = (intersection[0] + rx, intersection[1] + ry)
+    else:
+        # Try to find corner using contour analysis
+        contours, _ = cv2.findContours(comp_mask_full, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            # Find the largest contour
+            largest_contour = max(contours, key=cv2.contourArea)
+            # Approximate the contour to find corner points
+            epsilon = 0.02 * cv2.arcLength(largest_contour, True)
+            approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+
+            # Find the point closest to the corner based on corner type
+            if corner == "tl":
+                target = (0, 0)
+            elif corner == "tr":
+                target = (roi_mask.shape[1] - 1, 0)
+            elif corner == "br":
+                target = (roi_mask.shape[1] - 1, roi_mask.shape[0] - 1)
+            else:  # bl
+                target = (0, roi_mask.shape[0] - 1)
+
+            # Find point in contour closest to target corner
+            if len(approx) > 0:
+                pts = approx.reshape(-1, 2)
+                dists = np.linalg.norm(pts - np.array(target), axis=1)
+                idx = int(np.argmin(dists))
+                corner_pt = pts[idx]
+                point = (float(corner_pt[0] + rx), float(corner_pt[1] + ry))
+            else:
+                # Fallback to center of mass of contour
+                M = cv2.moments(largest_contour)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    point = (float(cx + rx), float(cy + ry))
+                else:
+                    # Final fallback: closest point to image center
+                    ys, xs = np.nonzero(comp_mask_full)
+                    if len(xs) == 0:
+                        return None, component_debug
+                    pts_global = np.stack([xs + rx, ys + ry], axis=1)
+                    center_arr = np.array([[image_center[0], image_center[1]]], dtype=np.float32)
+                    dists = np.linalg.norm(pts_global - center_arr, axis=1)
+                    idx = int(np.argmin(dists))
+                    point = (float(pts_global[idx, 0]), float(pts_global[idx, 1]))
+        else:
+            # Fallback: closest point to image center
+            ys, xs = np.nonzero(comp_mask_full)
+            if len(xs) == 0:
+                return None, component_debug
+            pts_global = np.stack([xs + rx, ys + ry], axis=1)
+            center_arr = np.array([[image_center[0], image_center[1]]], dtype=np.float32)
+            dists = np.linalg.norm(pts_global - center_arr, axis=1)
+            idx = int(np.argmin(dists))
+            point = (float(pts_global[idx, 0]), float(pts_global[idx, 1]))
 
     return point, component_debug
 
@@ -228,6 +288,26 @@ def compute_warp(corners: np.ndarray, inset: int) -> Tuple[np.ndarray, Tuple[int
     return matrix, (width, height), inset_corners
 
 
+def preprocess_alternative(gray: np.ndarray) -> Dict[str, np.ndarray]:
+    """Alternative preprocessing with more lenient thresholding for photographed images"""
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Try Otsu thresholding as alternative
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    min_dim = min(gray.shape[:2])
+    k = int(max(3, min(KERNEL_MAX // 2, THICK_K_FRAC * min_dim * 0.5)))  # Smaller kernel
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    if cv2.countNonZero(opened) == 0:
+        opened = binary  # fallback if everything was removed
+
+    thick = cv2.dilate(opened, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+    bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
+    thick = cv2.morphologyEx(thick, cv2.MORPH_CLOSE, bridge_kernel, iterations=1)
+    return {"binary": binary, "thick": thick, "kernel_size": k}
+
+
 def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
     image = cv2.imread(str(path))
     if image is None:
@@ -248,6 +328,19 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
         pt, comp_dbg = find_corner_in_roi(processed["thick"], roi, corner_name, image_center, debug_dir, path.stem)
         corners[corner_name] = pt
         component_logs[corner_name] = comp_dbg
+
+    # If some corners are missing, try alternative preprocessing
+    missing_corners = [name for name, pt in corners.items() if pt is None]
+    if missing_corners:
+        processed_alt = preprocess_alternative(gray)
+        write_debug_image(processed_alt["thick"], debug_dir / f"{path.stem}_mask_thick_alt.png")
+
+        for corner_name in missing_corners:
+            roi = rois[corner_name]
+            pt, comp_dbg = find_corner_in_roi(processed_alt["thick"], roi, corner_name, image_center, debug_dir, path.stem)
+            if pt is not None:  # Only update if we found something
+                corners[corner_name] = pt
+                component_logs[corner_name] = comp_dbg
 
     debug_data: Dict = {
         "image": {"width": width, "height": height, "path": str(path)},
