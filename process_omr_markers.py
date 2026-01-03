@@ -16,8 +16,28 @@ INNER_DENSITY_MAX = 0.25
 INSET_FRAC = 0.012
 KERNEL_MAX = 15  # cap to avoid erasing strokes on phone photos
 ROI_PAD = 12  # slight expansion to keep L legs inside ROI
+DEBUG_MAX_DIM = 1600
+DEBUG_JPEG_QUALITY = 85
+DEBUG_PNG_COMPRESSION = 3
 
 Point = Tuple[float, float]
+
+
+def write_debug_image(image: np.ndarray, path: Path) -> None:
+    h, w = image.shape[:2]
+    max_dim = max(h, w)
+    if max_dim > DEBUG_MAX_DIM:
+        scale = DEBUG_MAX_DIM / float(max_dim)
+        image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+    params = []
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        params = [cv2.IMWRITE_JPEG_QUALITY, DEBUG_JPEG_QUALITY]
+    elif suffix == ".png":
+        params = [cv2.IMWRITE_PNG_COMPRESSION, DEBUG_PNG_COMPRESSION]
+
+    cv2.imwrite(str(path), image, params)
 
 
 def preprocess(gray: np.ndarray) -> Dict[str, np.ndarray]:
@@ -113,7 +133,7 @@ def intersect_lines(line1: Tuple[int, int, int, int], line2: Tuple[int, int, int
 def find_corner_in_roi(thick_mask: np.ndarray, roi: Tuple[int, int, int, int], corner: str, image_center: Tuple[float, float], debug_dir: Path, stem: str) -> Tuple[Optional[Point], Dict]:
     rx, ry, rw, rh = roi
     roi_mask = thick_mask[ry : ry + rh, rx : rx + rw]
-    cv2.imwrite(str(debug_dir / f"{stem}_roi_{corner}_thick.png"), roi_mask)
+    write_debug_image(roi_mask, debug_dir / f"{stem}_roi_{corner}_thick.png")
     _, labels, stats, _ = cv2.connectedComponentsWithStats(roi_mask, connectivity=8)
 
     best_score = -1.0
@@ -144,7 +164,7 @@ def find_corner_in_roi(thick_mask: np.ndarray, roi: Tuple[int, int, int, int], c
     color = cv2.cvtColor(roi_mask, cv2.COLOR_GRAY2BGR)
     contours, _ = cv2.findContours(comp_mask_full, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(color, contours, -1, (0, 0, 255), 2)
-    cv2.imwrite(str(debug_dir / f"{stem}_roi_{corner}_comp.png"), color)
+    write_debug_image(color, debug_dir / f"{stem}_roi_{corner}_comp.png")
 
     edges = cv2.Canny(comp_mask_full, 50, 150)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=25, minLineLength=15, maxLineGap=8)
@@ -216,8 +236,8 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
     height, width = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     processed = preprocess(gray)
-    cv2.imwrite(str(debug_dir / f"{path.stem}_mask_binary.png"), processed["binary"])
-    cv2.imwrite(str(debug_dir / f"{path.stem}_mask_thick.png"), processed["thick"])
+    write_debug_image(processed["binary"], debug_dir / f"{path.stem}_mask_binary.png")
+    write_debug_image(processed["thick"], debug_dir / f"{path.stem}_mask_thick.png")
 
     rois = extract_rois(width, height)
     image_center = (width / 2.0, height / 2.0)
@@ -257,7 +277,7 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
     if any(pt is None for pt in found_points):
         found_count = sum(pt is not None for pt in found_points)
         debug_data["status"] = f"fail_missing ({found_count}/4)"
-        cv2.imwrite(str(debug_dir / f"{path.stem}_debug_rois_and_points.png"), overlay)
+        write_debug_image(overlay, debug_dir / f"{path.stem}_debug_rois_and_points.png")
         with open(debug_dir / f"{path.stem}_data.json", "w", encoding="utf-8") as fp:
             json.dump(debug_data, fp, indent=2)
         return debug_data
@@ -268,8 +288,8 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
     warped = cv2.warpPerspective(image, warp_matrix, size)
 
     cv2.polylines(overlay, [np.array(inset_corners, dtype=np.int32)], True, (255, 0, 255), 3)
-    cv2.imwrite(str(debug_dir / f"{path.stem}_debug_rois_and_points.png"), overlay)
-    cv2.imwrite(str(debug_dir / f"{path.stem}_debug_final_quad.png"), overlay)
+    write_debug_image(overlay, debug_dir / f"{path.stem}_debug_rois_and_points.png")
+    write_debug_image(overlay, debug_dir / f"{path.stem}_debug_final_quad.png")
     cv2.imwrite(str(output_dir / f"{path.stem}_crop.png"), warped)
 
     debug_data.update(
