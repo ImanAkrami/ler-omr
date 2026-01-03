@@ -132,18 +132,43 @@ def component_score(mask: np.ndarray, corner: str) -> Tuple[float, float, float,
     return score, h_density, v_density, inner_density
 
 
-def intersect_lines(line1: Tuple[int, int, int, int], line2: Tuple[int, int, int, int]) -> Optional[Tuple[float, float]]:
-    x1, y1, x2, y2 = line1
-    x3, y3, x4, y4 = line2
-    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-    if denom == 0:
+def outer_vertex_from_component(comp_mask_full: np.ndarray, rx: int, ry: int, corner: str) -> Optional[Point]:
+    """Returns the outermost vertex from the selected component.
+
+    Args:
+        comp_mask_full: ROI-space mask of the selected CC, uint8 0/255
+        rx, ry: ROI origin in full image coordinates
+        corner: "tl"|"tr"|"br"|"bl"
+
+    Returns:
+        (x, y) in full image coordinates, or None if no pixels found
+    """
+    ys, xs = np.nonzero(comp_mask_full)
+    if len(xs) == 0:
         return None
-    px = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / denom
-    py = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / denom
-    return float(px), float(py)
+
+    # Convert to full image coordinates
+    X = xs + rx
+    Y = ys + ry
+
+    # Choose extreme point depending on corner
+    if corner == "tl":
+        # Minimize (X + Y)
+        idx = int(np.argmin(X + Y))
+    elif corner == "tr":
+        # Maximize (X - Y) equivalent to minimize (Y - X)
+        idx = int(np.argmax(X - Y))
+    elif corner == "br":
+        # Maximize (X + Y)
+        idx = int(np.argmax(X + Y))
+    else:  # bl
+        # Maximize (Y - X) equivalent to minimize (X - Y)
+        idx = int(np.argmax(Y - X))
+
+    return (float(X[idx]), float(Y[idx]))
 
 
-def find_corner_in_roi(thick_mask: np.ndarray, roi: Tuple[int, int, int, int], corner: str, image_center: Tuple[float, float], debug_dir: Path, stem: str) -> Tuple[Optional[Point], Dict]:
+def find_corner_in_roi(thick_mask: np.ndarray, roi: Tuple[int, int, int, int], corner: str, image_center: Tuple[float, float], debug_dir: Path, stem: str, image_width: Optional[int] = None, image_height: Optional[int] = None) -> Tuple[Optional[Point], Dict]:
     rx, ry, rw, rh = roi
     roi_mask = thick_mask[ry : ry + rh, rx : rx + rw]
     write_debug_image(roi_mask, debug_dir / f"{stem}_roi_{corner}_thick.png")
@@ -179,83 +204,107 @@ def find_corner_in_roi(thick_mask: np.ndarray, roi: Tuple[int, int, int, int], c
     cv2.drawContours(color, contours, -1, (0, 0, 255), 2)
     write_debug_image(color, debug_dir / f"{stem}_roi_{corner}_comp.png")
 
-    # Try multiple methods to find the corner point
-    edges = cv2.Canny(comp_mask_full, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=25, minLineLength=15, maxLineGap=8)
-    horizontal_line: Optional[Tuple[int, int, int, int]] = None
-    vertical_line: Optional[Tuple[int, int, int, int]] = None
-    if lines is not None:
-        for x1, y1, x2, y2 in lines[:, 0, :]:
-            angle = abs(math.degrees(math.atan2(y2 - y1, x2 - x1)))
-            length = math.hypot(x2 - x1, y2 - y1)
-            if angle < 15 or angle > 165:
-                if horizontal_line is None or length > math.hypot(horizontal_line[2] - horizontal_line[0], horizontal_line[3] - horizontal_line[1]):
-                    horizontal_line = (x1, y1, x2, y2)
-            if 75 <= angle <= 105:
-                if vertical_line is None or length > math.hypot(vertical_line[2] - vertical_line[0], vertical_line[3] - vertical_line[1]):
-                    vertical_line = (x1, y1, x2, y2)
+    # Use deterministic outer vertex method (primary)
+    point = outer_vertex_from_component(comp_mask_full, rx, ry, corner)
+    if point is None:
+        return None, component_debug
 
-    intersection: Optional[Tuple[float, float]] = None
-    if horizontal_line is not None and vertical_line is not None:
-        intersection = intersect_lines(horizontal_line, vertical_line)
+    # Compute component pixel extremes for sanity check
+    ys, xs = np.nonzero(comp_mask_full)
+    if len(xs) == 0:
+        return None, component_debug
 
-    # If intersection found, use it; otherwise try contour-based corner detection
-    if intersection is not None:
-        point = (intersection[0] + rx, intersection[1] + ry)
-    else:
-        # Try to find corner using contour analysis
-        contours, _ = cv2.findContours(comp_mask_full, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            # Find the largest contour
-            largest_contour = max(contours, key=cv2.contourArea)
-            # Approximate the contour to find corner points
-            epsilon = 0.02 * cv2.arcLength(largest_contour, True)
-            approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+    X = xs + rx
+    Y = ys + ry
+    minX, maxX = float(X.min()), float(X.max())
+    minY, maxY = float(Y.min()), float(Y.max())
+    cw = maxX - minX
+    ch = maxY - minY
 
-            # Find the point closest to the corner based on corner type
+    # Sanity check: verify picked point is near expected extremes
+    px, py = point[0], point[1]
+    dx = 0.15 * cw
+    dy = 0.15 * ch
+    picked_method = "outer_vertex"
+
+    sanity_passed = False
+    if corner == "tl":
+        sanity_passed = (px <= minX + dx) and (py <= minY + dy)
+    elif corner == "tr":
+        sanity_passed = (px >= maxX - dx) and (py <= minY + dy)
+    elif corner == "br":
+        sanity_passed = (px >= maxX - dx) and (py >= maxY - dy)
+    else:  # bl
+        sanity_passed = (px <= minX + dx) and (py >= maxY - dy)
+
+    # Fallback: windowed-extrema corner pick if sanity check fails
+    if not sanity_passed:
+        picked_method = "fallback_windowed_extrema"
+        dx_fallback = dx
+        dy_fallback = dy
+
+        # Define candidate windows based on corner type
+        if corner == "tl":
+            candidates_mask = (X <= minX + dx_fallback) & (Y <= minY + dy_fallback)
+            ideal = (minX, minY)
+        elif corner == "tr":
+            candidates_mask = (X >= maxX - dx_fallback) & (Y <= minY + dy_fallback)
+            ideal = (maxX, minY)
+        elif corner == "br":
+            candidates_mask = (X >= maxX - dx_fallback) & (Y >= maxY - dy_fallback)
+            ideal = (maxX, maxY)
+        else:  # bl
+            candidates_mask = (X <= minX + dx_fallback) & (Y >= maxY - dy_fallback)
+            ideal = (minX, maxY)
+
+        candidates = np.where(candidates_mask)[0]
+
+        # If no candidates, relax tolerance once
+        if len(candidates) == 0:
+            dx_fallback *= 1.8
+            dy_fallback *= 1.8
             if corner == "tl":
-                target = (0, 0)
+                candidates_mask = (X <= minX + dx_fallback) & (Y <= minY + dy_fallback)
             elif corner == "tr":
-                target = (roi_mask.shape[1] - 1, 0)
+                candidates_mask = (X >= maxX - dx_fallback) & (Y <= minY + dy_fallback)
             elif corner == "br":
-                target = (roi_mask.shape[1] - 1, roi_mask.shape[0] - 1)
+                candidates_mask = (X >= maxX - dx_fallback) & (Y >= maxY - dy_fallback)
             else:  # bl
-                target = (0, roi_mask.shape[0] - 1)
+                candidates_mask = (X <= minX + dx_fallback) & (Y >= maxY - dy_fallback)
+            candidates = np.where(candidates_mask)[0]
 
-            # Find point in contour closest to target corner
-            if len(approx) > 0:
-                pts = approx.reshape(-1, 2)
-                dists = np.linalg.norm(pts - np.array(target), axis=1)
-                idx = int(np.argmin(dists))
-                corner_pt = pts[idx]
-                point = (float(corner_pt[0] + rx), float(corner_pt[1] + ry))
-            else:
-                # Fallback to center of mass of contour
-                M = cv2.moments(largest_contour)
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    point = (float(cx + rx), float(cy + ry))
-                else:
-                    # Final fallback: closest point to image center
-                    ys, xs = np.nonzero(comp_mask_full)
-                    if len(xs) == 0:
-                        return None, component_debug
-                    pts_global = np.stack([xs + rx, ys + ry], axis=1)
-                    center_arr = np.array([[image_center[0], image_center[1]]], dtype=np.float32)
-                    dists = np.linalg.norm(pts_global - center_arr, axis=1)
-                    idx = int(np.argmin(dists))
-                    point = (float(pts_global[idx, 0]), float(pts_global[idx, 1]))
-        else:
-            # Fallback: closest point to image center
-            ys, xs = np.nonzero(comp_mask_full)
-            if len(xs) == 0:
-                return None, component_debug
-            pts_global = np.stack([xs + rx, ys + ry], axis=1)
-            center_arr = np.array([[image_center[0], image_center[1]]], dtype=np.float32)
-            dists = np.linalg.norm(pts_global - center_arr, axis=1)
-            idx = int(np.argmin(dists))
-            point = (float(pts_global[idx, 0]), float(pts_global[idx, 1]))
+        # Pick candidate closest to ideal corner
+        if len(candidates) > 0:
+            ideal_x, ideal_y = ideal
+            dists = (X[candidates] - ideal_x) ** 2 + (Y[candidates] - ideal_y) ** 2
+            idx = int(candidates[np.argmin(dists)])
+            point = (float(X[idx]), float(Y[idx]))
+        # If still no candidates, keep original point (don't crash)
+
+    # Add debug info to component_debug
+    component_debug["picked_method"] = picked_method
+    component_debug["component_extremes"] = {
+        "minX": minX,
+        "maxX": maxX,
+        "minY": minY,
+        "maxY": maxY,
+        "cw": cw,
+        "ch": ch,
+        "dx": dx,
+        "dy": dy,
+    }
+
+    # Debug overlay: show the chosen vertex
+    picked_color = color.copy()
+    px_roi = int(point[0] - rx)
+    py_roi = int(point[1] - ry)
+    cv2.circle(picked_color, (px_roi, py_roi), 5, (0, 255, 0), -1)
+
+    # If fallback was used, save additional debug image
+    if picked_method == "fallback_windowed_extrema":
+        write_debug_image(picked_color, debug_dir / f"{stem}_roi_{corner}_picked_fallback.png")
+    else:
+        write_debug_image(picked_color, debug_dir / f"{stem}_roi_{corner}_picked.png")
 
     return point, component_debug
 
@@ -325,7 +374,7 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
     component_logs: Dict[str, Dict] = {}
 
     for corner_name, roi in rois.items():
-        pt, comp_dbg = find_corner_in_roi(processed["thick"], roi, corner_name, image_center, debug_dir, path.stem)
+        pt, comp_dbg = find_corner_in_roi(processed["thick"], roi, corner_name, image_center, debug_dir, path.stem, width, height)
         corners[corner_name] = pt
         component_logs[corner_name] = comp_dbg
 
@@ -337,7 +386,7 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
 
         for corner_name in missing_corners:
             roi = rois[corner_name]
-            pt, comp_dbg = find_corner_in_roi(processed_alt["thick"], roi, corner_name, image_center, debug_dir, path.stem)
+            pt, comp_dbg = find_corner_in_roi(processed_alt["thick"], roi, corner_name, image_center, debug_dir, path.stem, width, height)
             if pt is not None:  # Only update if we found something
                 corners[corner_name] = pt
                 component_logs[corner_name] = comp_dbg
