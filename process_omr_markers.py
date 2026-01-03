@@ -20,7 +20,44 @@ DEBUG_MAX_DIM = 1600
 DEBUG_JPEG_QUALITY = 85
 DEBUG_PNG_COMPRESSION = 3
 
+# Aspect ratio fix
+TARGET_ASPECT = 0.668  # width / height
+RATIO_FIX_MODE = "stretch"  # "stretch" = resize to match (no padding/cropping)
+
 Point = Tuple[float, float]
+
+
+def fix_aspect_ratio(image: np.ndarray, target_aspect: float, mode: str = "stretch") -> Tuple[np.ndarray, bool]:
+    """Fix image aspect ratio to target by resizing (stretching in smaller dimension).
+
+    Args:
+        image: BGR image (numpy array)
+        target_aspect: Target width/height ratio
+        mode: "stretch" = resize to match (no padding/cropping)
+
+    Returns:
+        (fixed_image, was_applied) tuple
+    """
+    h, w = image.shape[:2]
+    cur_aspect = w / h
+
+    # If already close, return original
+    if abs(cur_aspect - target_aspect) < 0.001:
+        return image, False
+
+    if mode == "stretch":
+        if cur_aspect < target_aspect:
+            # Too narrow: stretch width (keep height, resize width)
+            new_w = round(target_aspect * h)
+            fixed = cv2.resize(image, (new_w, h), interpolation=cv2.INTER_LINEAR)
+        else:
+            # Too wide: stretch height (keep width, resize height)
+            new_h = round(w / target_aspect)
+            fixed = cv2.resize(image, (w, new_h), interpolation=cv2.INTER_LINEAR)
+        return fixed, True
+    else:
+        # Fallback: return original if unknown mode
+        return image, False
 
 
 def write_debug_image(image: np.ndarray, path: Path) -> None:
@@ -429,10 +466,21 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
     warp_matrix, size, inset_corners = compute_warp(ordered_corners, inset)
     warped = cv2.warpPerspective(image, warp_matrix, size)
 
+    # Fix aspect ratio to target
+    warped_h, warped_w = warped.shape[:2]
+    aspect_before = warped_w / warped_h
+    warped_fixed, ratio_fix_applied = fix_aspect_ratio(warped, TARGET_ASPECT, mode=RATIO_FIX_MODE)
+    warped_fixed_h, warped_fixed_w = warped_fixed.shape[:2]
+    aspect_after = warped_fixed_w / warped_fixed_h
+
     cv2.polylines(overlay, [np.array(inset_corners, dtype=np.int32)], True, (255, 0, 255), 3)
     write_debug_image(overlay, debug_dir / f"{path.stem}_debug_rois_and_points.png")
     write_debug_image(overlay, debug_dir / f"{path.stem}_debug_final_quad.png")
-    cv2.imwrite(str(output_dir / f"{path.stem}_crop.png"), warped)
+    cv2.imwrite(str(output_dir / f"{path.stem}_crop.png"), warped_fixed)
+
+    # Save debug image if ratio fix was applied
+    if ratio_fix_applied:
+        write_debug_image(warped_fixed, debug_dir / f"{path.stem}_crop_ratio_fixed.png")
 
     debug_data.update(
         {
@@ -440,6 +488,13 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
             "status": "success",
             "warp_size": {"width": size[0], "height": size[1]},
             "inset": inset,
+            "aspect_ratio": {
+                "target_aspect": TARGET_ASPECT,
+                "aspect_before": aspect_before,
+                "aspect_after": aspect_after,
+                "ratio_fix_mode": RATIO_FIX_MODE,
+                "ratio_fix_applied": ratio_fix_applied,
+            },
         }
     )
 
