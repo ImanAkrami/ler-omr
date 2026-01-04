@@ -2,7 +2,7 @@ import shutil
 import unittest
 from pathlib import Path
 
-import process_omr_markers
+import main_processor
 
 
 class ProcessOmrMarkersIntegrationTest(unittest.TestCase):
@@ -14,7 +14,11 @@ class ProcessOmrMarkersIntegrationTest(unittest.TestCase):
         shutil.rmtree(output_dir, ignore_errors=True)
         shutil.rmtree(debug_dir, ignore_errors=True)
 
-        results = process_omr_markers.run(input_dir, output_dir, debug_dir)
+        # Process each image file individually
+        results = {}
+        for image_path in sorted(input_dir.glob("*.jpg")):
+            result = main_processor.process_single_file(image_path, input_dir, output_dir, debug_dir)
+            results[image_path.name] = result["overall_status"]
 
         photographed = {
             "filled_sheet_all_mcq_photographed.jpg",

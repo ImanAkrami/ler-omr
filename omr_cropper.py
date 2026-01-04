@@ -1,6 +1,4 @@
-import argparse
 import json
-import math
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -503,43 +501,3 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
 
     return debug_data
 
-
-def run(input_dir: Path, output_dir: Path, debug_dir: Path) -> Dict[str, str]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    debug_dir.mkdir(parents=True, exist_ok=True)
-
-    results: Dict[str, str] = {}
-    for path in sorted(input_dir.glob("*.jpg")):
-        try:
-            debug_data = process_image(path, output_dir, debug_dir)
-            results[path.name] = debug_data["status"]
-        except Exception as exc:  # noqa: BLE001
-            results[path.name] = f"error: {exc}"
-    return results
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Detect OMR markers, deskew, and crop using L-shaped corners.")
-    parser.add_argument("--input-dir", type=Path, default=Path("inputs"), help="Directory containing input images.")
-    parser.add_argument("--output-dir", type=Path, default=Path("output/crops"), help="Directory to write cropped outputs.")
-    parser.add_argument(
-        "--debug-dir",
-        type=Path,
-        default=Path("output/debug"),
-        help="Directory to write debug visualizations and metadata.",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    results = run(args.input_dir, args.output_dir, args.debug_dir)
-    success = sum(1 for status in results.values() if status == "success")
-    total = len(results)
-    print(f"Processed {total} images. Success: {success}. Failures: {total - success}.")
-    for name, status in results.items():
-        print(f"  {name}: {status}")
-
-
-if __name__ == "__main__":
-    main()
