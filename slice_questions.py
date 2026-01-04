@@ -16,7 +16,6 @@ python omr_slice_simple.py --image /path/to/crop.png --out out_dir
 
 import argparse
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Dict
 
@@ -52,6 +51,27 @@ HORIZ_KERNEL_H = 1
 ROW_PEAK_THRESH = 0.35      # relative peak threshold
 ROW_CLUSTER_TOL_PX = 6       # cluster close peaks
 MIN_ROW_H_FRAC = 0.012       # discard ultra tiny rows
+
+# Question box contour detection
+RECT_MIN_W_FRAC_IMG = 0.26   # min width relative to image width
+RECT_MAX_W_FRAC_IMG = 0.70   # max width relative to image width (keeps us inside a column)
+RECT_MIN_H_FRAC_IMG = 0.012  # min height relative to image height
+RECT_MAX_H_FRAC_IMG = 0.20   # max height relative to image height (supports long open questions)
+RECT_ASPECT_MIN = 3.0        # w/h lower bound
+RECT_ASPECT_MAX = 25.0       # w/h upper bound
+RECT_CLOSE_K = (5, 5)        # closing kernel before contour detection
+RECT_Y_MERGE_GAP_PX = 6      # merge close rectangles
+RECT_MIN_PER_COL = 18        # if fewer than this, try helper/horiz fallback
+
+# Helper bar (thick right strip inside each question)
+BAR_BAND_FRAC = 0.18         # portion (from the right of a column) to search for the helper bar
+BAR_MIN_W_FRAC = 0.01        # minimum helper bar width relative to column width
+BAR_MIN_H_FRAC = 0.012       # minimum helper bar height relative to column height
+BAR_MIN_AREA_FRAC = 0.00025  # min area relative to column area
+BAR_MERGE_GAP_FRAC = 0.004   # merge neighbouring helper fragments separated by small gaps
+BAR_CORE_W_FRAC = 0.32       # keep only the densest vertical slice inside the helper band
+BAR_Y_THRESH_FRAC = 0.08     # threshold relative to peak y-projection
+BAR_CLOSE_KH = 13            # vertical closing kernel to seal tiny holes inside the bar
 
 # Cropping
 NUMBER_STRIP_FRAC = 0.14     # remove question-number strip on right side of each row (inside column)
@@ -205,6 +225,268 @@ def y_peaks_from_horiz(horiz_roi: np.ndarray) -> List[int]:
 
     return clustered
 
+
+def merge_spans(spans: List[Tuple[int, int]], max_gap: int) -> List[Tuple[int, int]]:
+    if not spans:
+        return []
+    spans = sorted(spans, key=lambda s: s[0])
+    merged = [list(spans[0])]
+    for a, b in spans[1:]:
+        if a - merged[-1][1] <= max_gap:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
+
+
+def merge_boxes_vert(boxes: List[Tuple[int, int, int, int]], max_gap: int) -> List[Tuple[int, int, int, int]]:
+    """
+    Merge rectangles that are vertically touching/close and largely aligned horizontally.
+    """
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+    merged: List[List[int]] = [list(boxes[0])]
+    for b in boxes[1:]:
+        last = merged[-1]
+        # vertical proximity + reasonable horizontal overlap
+        if b[1] - last[3] <= max_gap and not (b[2] < last[0] or b[0] > last[2]):
+            last[0] = min(last[0], b[0])
+            last[1] = min(last[1], b[1])
+            last[2] = max(last[2], b[2])
+            last[3] = max(last[3], b[3])
+        else:
+            merged.append(list(b))
+    return [(int(a), int(b), int(c), int(d)) for a, b, c, d in merged]
+
+
+def helper_bar_spans(
+    bin_ink: np.ndarray,
+    col_x0: int,
+    col_x1: int,
+    y0: int,
+    y1: int
+) -> Tuple[List[Tuple[int, int]], Dict, np.ndarray]:
+    """
+    Locate helper bar components inside the right-side band of a column.
+    Returns (spans, debug_info, mask_on_full_image).
+    """
+    h, w = bin_ink.shape[:2]
+    col_x0 = max(0, min(col_x0, w - 1))
+    col_x1 = max(0, min(col_x1, w))
+    y0 = max(0, min(y0, h - 1))
+    y1 = max(0, min(y1, h))
+
+    col = bin_ink[y0:y1, col_x0:col_x1]
+    col_h, col_w = col.shape[:2]
+    band_w = max(8, int(col_w * BAR_BAND_FRAC))
+    band_x0 = max(0, col_w - band_w)
+    band = col[:, band_x0:]
+
+    # Clean minor holes inside the thick bar without merging neighbouring rows
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
+    band_clean = cv2.morphologyEx(band, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    # Focus on the densest vertical slice of the band to isolate the helper bar
+    x_proj = band_clean.sum(axis=0).astype(np.float32)
+    peak_x_rel = int(np.argmax(x_proj)) if x_proj.size else 0
+    core_w = max(max(3, int(col_w * BAR_MIN_W_FRAC)), int(band_w * BAR_CORE_W_FRAC))
+    core_x0 = max(0, min(peak_x_rel - core_w // 2, band_w - core_w))
+    core_x1 = core_x0 + core_w
+
+    core = np.zeros_like(band_clean)
+    core[:, core_x0:core_x1] = band_clean[:, core_x0:core_x1]
+
+    # Close vertically to bridge tiny gaps and ink holes
+    close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, BAR_CLOSE_KH))
+    core_closed = cv2.morphologyEx(core, cv2.MORPH_CLOSE, close_k, iterations=1)
+
+    y_proj = core_closed.sum(axis=1).astype(np.float32)
+    spans: List[Tuple[int, int]] = []
+    kept_components: List[Dict] = []
+
+    if y_proj.size:
+        thr = y_proj.max() * BAR_Y_THRESH_FRAC
+        min_h = max(12, int(col_h * BAR_MIN_H_FRAC))
+
+        in_run = False
+        start = 0
+        for i, v in enumerate(y_proj):
+            if v > thr and not in_run:
+                in_run = True
+                start = i
+            elif v <= thr and in_run:
+                end = i
+                if end - start >= min_h:
+                    spans.append((start + y0, end + y0))
+                in_run = False
+        if in_run:
+            end = len(y_proj) - 1
+            if end - start >= min_h:
+                spans.append((start + y0, end + y0))
+
+        merge_gap = max(6, int((y1 - y0) * BAR_MERGE_GAP_FRAC))
+        spans = merge_spans(spans, merge_gap)
+
+        for sy0, sy1 in spans:
+            h_box = sy1 - sy0
+            area_est = int(y_proj[max(0, sy0 - y0):max(0, sy1 - y0)].sum() / max(1, core_w))
+            kept_components.append(
+                {
+                    "y0": int(sy0),
+                    "y1": int(sy1),
+                    "h": int(h_box),
+                    "w": int(core_w),
+                    "area_est": int(area_est),
+                }
+            )
+    else:
+        merge_gap = max(6, int((y1 - y0) * BAR_MERGE_GAP_FRAC))
+
+    mask_full = np.zeros_like(bin_ink, dtype=np.uint8)
+    mask_full[y0:y1, col_x0 + band_x0 + core_x0:col_x0 + band_x0 + core_x1] = core_closed[:, core_x0:core_x1]
+
+    debug = {
+        "band_x0": int(col_x0 + band_x0),
+        "band_w": int(band_w),
+        "core_x0": int(core_x0),
+        "core_w": int(core_w),
+        "peak_x_rel": int(peak_x_rel),
+        "y_threshold": float(y_proj.max() * BAR_Y_THRESH_FRAC) if y_proj.size else 0.0,
+        "merge_gap": int(merge_gap),
+        "candidates": kept_components,
+        "spans": [(int(a), int(b)) for a, b in spans],
+    }
+    return spans, debug, mask_full
+
+
+def rect_candidates(
+    bin_ink: np.ndarray, y0: int, y1: int
+) -> Tuple[List[Tuple[int, int, int, int]], Dict, np.ndarray]:
+    """
+    Detect rectangular question boxes over the whole sheet.
+    Returns (boxes, debug_info, mask).
+    """
+    h, w = bin_ink.shape[:2]
+    y0 = max(0, min(y0, h - 1))
+    y1 = max(0, min(y1, h))
+    roi = bin_ink[y0:y1, :]
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, RECT_CLOSE_K)
+    closed = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes: List[Tuple[int, int, int, int]] = []
+    min_w = int(w * RECT_MIN_W_FRAC_IMG)
+    max_w = int(w * RECT_MAX_W_FRAC_IMG)
+    min_h = int(h * RECT_MIN_H_FRAC_IMG)
+    max_h = int(h * RECT_MAX_H_FRAC_IMG)
+    for c in contours:
+        x, y, bw, bh = cv2.boundingRect(c)
+        y_abs = y + y0
+        if bw < min_w or bw > max_w or bh < min_h or bh > max_h:
+            continue
+        aspect = bw / max(bh, 1)
+        if aspect < RECT_ASPECT_MIN or aspect > RECT_ASPECT_MAX:
+            continue
+        boxes.append((x, y_abs, x + bw, y_abs + bh))
+
+    boxes = merge_boxes_vert(boxes, RECT_Y_MERGE_GAP_PX)
+
+    mask = np.zeros_like(bin_ink, dtype=np.uint8)
+    for b in boxes:
+        cv2.rectangle(mask, (b[0], b[1]), (b[2], b[3]), 255, 1)
+
+    dbg = {
+        "min_w": int(min_w),
+        "max_w": int(max_w),
+        "min_h": int(min_h),
+        "max_h": int(max_h),
+        "aspect_min": RECT_ASPECT_MIN,
+        "aspect_max": RECT_ASPECT_MAX,
+        "merge_gap_px": RECT_Y_MERGE_GAP_PX,
+        "candidate_count": len(boxes),
+    }
+    return boxes, dbg, mask
+
+
+def rect_row_spans(
+    bin_ink: np.ndarray,
+    col_x0: int,
+    col_x1: int,
+    y0: int,
+    y1: int,
+    img_w: int,
+    img_h: int,
+) -> Tuple[List[Tuple[int, int, int, int]], Dict, np.ndarray]:
+    """
+    Detect question rows via rectangular contour boxes inside a column ROI.
+    Returns (boxes, debug_info, mask_on_full_image).
+    """
+    h, w = bin_ink.shape[:2]
+    col_x0 = max(0, min(col_x0, w - 1))
+    col_x1 = max(0, min(col_x1, w))
+    y0 = max(0, min(y0, h - 1))
+    y1 = max(0, min(y1, h))
+
+    roi = bin_ink[y0:y1, col_x0:col_x1]
+    col_w = col_x1 - col_x0
+    min_w = max(10, int(col_w * RECT_MIN_W_FRAC))
+    max_w = int(col_w * RECT_MAX_W_FRAC)
+    min_h = max(8, int(img_h * RECT_MIN_H_FRAC))
+    max_h = int(img_h * RECT_MAX_H_FRAC)
+
+    # Slightly close to connect gaps on the rectangle strokes
+    closed = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cand_boxes: List[Tuple[int, int, int, int]] = []
+    for c in contours:
+        x, y, ww, hh = cv2.boundingRect(c)
+        if ww < min_w or ww > max_w or hh < min_h or hh > max_h:
+            continue
+        aspect = ww / max(hh, 1)
+        if aspect < RECT_ASPECT_MIN or aspect > RECT_ASPECT_MAX:
+            continue
+        # Keep only rectangles that sit well inside the ROI (avoid header line)
+        cand_boxes.append((col_x0 + x, y0 + y, col_x0 + x + ww, y0 + y + hh))
+
+    # Merge vertically-close candidates
+    cand_boxes = sorted(cand_boxes, key=lambda b: (b[1], b[0]))
+    merged: List[Tuple[int, int, int, int]] = []
+    merge_gap = max(4, int(img_h * RECT_MERGE_GAP_FRAC))
+    for b in cand_boxes:
+        if not merged:
+            merged.append(list(b))
+            continue
+        last = merged[-1]
+        if b[1] - last[3] <= merge_gap and abs(b[0] - last[0]) < col_w * 0.15:
+            last[0] = min(last[0], b[0])
+            last[2] = max(last[2], b[2])
+            last[3] = max(last[3], b[3])
+        else:
+            merged.append(list(b))
+
+    merged_boxes = [(int(a), int(b), int(c), int(d)) for a, b, c, d in merged]
+
+    # Build mask for debug
+    mask = np.zeros_like(bin_ink, dtype=np.uint8)
+    for (x0, y0b, x1, y1b) in merged_boxes:
+        cv2.rectangle(mask, (x0, y0b), (x1, y1b), 255, 1)
+
+    debug = {
+        "min_w": int(min_w),
+        "max_w": int(max_w),
+        "min_h": int(min_h),
+        "max_h": int(max_h),
+        "aspect_min": RECT_ASPECT_MIN,
+        "aspect_max": RECT_ASPECT_MAX,
+        "merge_gap": int(merge_gap),
+        "candidates": [list(map(int, b)) for b in cand_boxes],
+        "merged": [list(map(int, b)) for b in merged_boxes],
+    }
+    return merged_boxes, debug, mask
+
 def build_row_boxes(
     horiz: np.ndarray,
     col_x0: int,
@@ -250,6 +532,129 @@ def build_row_boxes(
             boxes.append((ax0, ay0, ax1, ay1))
 
     return boxes
+
+
+def boxes_from_spans(
+    spans: List[Tuple[int, int]],
+    col_x0: int,
+    col_x1: int,
+    img_w: int,
+    img_h: int,
+) -> List[Tuple[int, int, int, int]]:
+    col_x0 = max(0, min(col_x0, img_w - 1))
+    col_x1 = max(0, min(col_x1, img_w))
+    boxes: List[Tuple[int, int, int, int]] = []
+    min_h = int(img_h * MIN_ROW_H_FRAC)
+
+    for y0, y1 in spans:
+        y0 = max(0, min(y0, img_h - 1))
+        y1 = max(0, min(y1, img_h))
+        if y1 - y0 < min_h:
+            continue
+        inset_y = int((y1 - y0) * ROW_INSET_Y_FRAC)
+        inset_x = int((col_x1 - col_x0) * ROW_INSET_X_FRAC)
+
+        ay0 = y0 + inset_y
+        ay1 = y1 - inset_y
+        ax0 = col_x0 + inset_x
+        ax1 = col_x1 - inset_x
+
+        if ay1 > ay0 and ax1 > ax0:
+            boxes.append((ax0, ay0, ax1, ay1))
+    return boxes
+
+
+def cluster_columns_from_boxes(boxes: List[Tuple[int, int, int, int]], img_w: int) -> Tuple[List[int], Dict]:
+    """
+    Cluster candidate rectangles into two columns based on x-center using k-means (k=2).
+    Returns labels per box and debug info.
+    """
+    if not boxes:
+        return [], {"labels": [], "centers": []}
+
+    pts = np.float32([[ (b[0] + b[2]) * 0.5 ] for b in boxes])
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.2)
+    compactness, labels, centers = cv2.kmeans(pts, 2, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+    labels = labels.flatten().tolist()
+    centers = centers.flatten().tolist()
+    # sort so column 0 = left
+    if centers[0] > centers[1]:
+        centers = centers[::-1]
+        labels = [1 - l for l in labels]
+
+    dbg = {"compactness": float(compactness), "centers": [float(c) for c in centers], "labels": labels}
+    return labels, dbg
+
+
+def filter_and_sort_boxes_by_column(
+    boxes: List[Tuple[int, int, int, int]],
+    labels: List[int],
+    col_idx: int,
+    header_y: int,
+    img_h: int,
+) -> List[Tuple[int, int, int, int]]:
+    col_boxes = [b for b, l in zip(boxes, labels) if l == col_idx and b[1] >= header_y]
+    col_boxes.sort(key=lambda b: b[1])
+    # drop duplicates/overlaps too close vertically
+    cleaned: List[Tuple[int, int, int, int]] = []
+    min_gap = max(4, int(img_h * 0.004))
+    for b in col_boxes:
+        if cleaned and b[1] - cleaned[-1][1] < min_gap and b[3] - cleaned[-1][3] < min_gap:
+            continue
+        cleaned.append(b)
+    return cleaned
+
+
+def detect_rows_for_column(
+    bin_ink: np.ndarray,
+    horiz: np.ndarray,
+    col_bounds: Tuple[int, int],
+    y0: int,
+    y1: int,
+    img_w: int,
+    img_h: int,
+    rect_boxes: List[Tuple[int, int, int, int]],
+    rect_labels: List[int],
+    col_idx: int,
+) -> Tuple[List[Tuple[int, int, int, int]], Dict, np.ndarray]:
+    """
+    Detect row boxes for a single column given precomputed rectangle candidates + labels.
+    Falls back to helper bar spans, then horizontal lines.
+    """
+    rect_in_col = filter_and_sort_boxes_by_column(rect_boxes, rect_labels, col_idx, y0, img_h)
+    rect_mask = np.zeros_like(bin_ink, dtype=np.uint8)
+    for b in rect_in_col:
+        cv2.rectangle(rect_mask, (b[0], b[1]), (b[2], b[3]), 255, 1)
+
+    if len(rect_in_col) >= RECT_MIN_PER_COL:
+        info = {
+            "method": "rectangles",
+            "rect_debug": {"selected": [list(map(int, b)) for b in rect_in_col]},
+            "count": len(rect_in_col),
+        }
+        return rect_in_col, info, rect_mask
+
+    spans, bar_dbg, bar_mask = helper_bar_spans(bin_ink, col_bounds[0], col_bounds[1], y0, y1)
+    if spans:
+        boxes = boxes_from_spans(spans, col_bounds[0], col_bounds[1], img_w, img_h)
+        info = {
+            "method": "helper_bar",
+            "bar_debug": bar_dbg,
+            "count": len(boxes),
+        }
+        return boxes, info, bar_mask
+
+    boxes = build_row_boxes(horiz, col_bounds[0], col_bounds[1], y0, y1 - 1, img_w, img_h)
+    info = {
+        "method": "horizontal_fallback",
+        "count": len(boxes),
+        "fallback": {
+            "row_peak_thresh": ROW_PEAK_THRESH,
+            "row_cluster_tol_px": ROW_CLUSTER_TOL_PX,
+            "min_row_h_frac": MIN_ROW_H_FRAC,
+        },
+    }
+    return boxes, info, np.zeros_like(bin_ink, dtype=np.uint8)
 
 def crop_row(img: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
     x0, y0, x1, y1 = box
@@ -314,9 +719,17 @@ def slice_sheet(image_path: Path, out_root: Path):
     colL = (margin, max(margin + 10, center_x - sep_pad))
     colR = (min(w - margin - 10, center_x + sep_pad), max(center_x + sep_pad + 10, right_x - rb_pad))
 
-    # 5) Row boxes per column
-    rows_L = build_row_boxes(horiz, colL[0], colL[1], header_y, h - 1, w, h)
-    rows_R = build_row_boxes(horiz, colR[0], colR[1], header_y, h - 1, w, h)
+    # 5) Rectangle candidates across the page + column clustering
+    rect_boxes, rect_dbg, rect_mask = rect_candidates(bin_ink, header_y, h - 1)
+    rect_labels, cluster_dbg = cluster_columns_from_boxes(rect_boxes, w)
+
+    # 6) Row boxes per column (rectangles preferred, helper/horiz fallback)
+    rows_L, info_L, mask_L = detect_rows_for_column(
+        bin_ink, horiz, colL, header_y, h - 1, w, h, rect_boxes, rect_labels, 0
+    )
+    rows_R, info_R, mask_R = detect_rows_for_column(
+        bin_ink, horiz, colR, header_y, h - 1, w, h, rect_boxes, rect_labels, 1
+    )
 
     # 6) Export crops
     exported = {"colL": [], "colR": []}
@@ -334,7 +747,7 @@ def slice_sheet(image_path: Path, out_root: Path):
             cv2.imwrite(str(out_q / name), crop, [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION])
             exported["colR"].append({"i": i, "box": list(map(int, box)), "file": name})
 
-    # 7) Debug overlay
+    # 7) Debug overlay and helper mask
     overlay = img.copy()
     cv2.line(overlay, (center_x, 0), (center_x, h - 1), (0, 255, 0), 2)
     cv2.line(overlay, (right_x, 0), (right_x, h - 1), (0, 200, 255), 2)
@@ -342,12 +755,27 @@ def slice_sheet(image_path: Path, out_root: Path):
     cv2.rectangle(overlay, (colL[0], header_y), (colL[1], h - 2), (255, 0, 0), 2)
     cv2.rectangle(overlay, (colR[0], header_y), (colR[1], h - 2), (255, 0, 0), 2)
 
+    if info_L["method"] == "helper_bar":
+        for y0, y1 in info_L["bar_debug"]["spans"]:
+            cv2.rectangle(overlay, (info_L["bar_debug"]["band_x0"], y0), (colL[1] - 1, y1), (0, 140, 255), 1)
+    if info_L["method"] == "rectangles":
+        for x0, y0, x1, y1 in info_L["rect_debug"]["selected"]:
+            cv2.rectangle(overlay, (x0, y0), (x1, y1), (120, 200, 255), 1)
     for b in rows_L:
         cv2.rectangle(overlay, (b[0], b[1]), (b[2], b[3]), (255, 0, 255), 1)
+    if info_R["method"] == "helper_bar":
+        for y0, y1 in info_R["bar_debug"]["spans"]:
+            cv2.rectangle(overlay, (info_R["bar_debug"]["band_x0"], y0), (colR[1] - 1, y1), (0, 255, 140), 1)
+    if info_R["method"] == "rectangles":
+        for x0, y0, x1, y1 in info_R["rect_debug"]["selected"]:
+            cv2.rectangle(overlay, (x0, y0), (x1, y1), (120, 255, 200), 1)
     for b in rows_R:
         cv2.rectangle(overlay, (b[0], b[1]), (b[2], b[3]), (0, 255, 255), 1)
 
     write_png(out_d / "05_overlay.png", overlay)
+    helper_mask = cv2.bitwise_or(mask_L, mask_R)
+    write_png(out_d / "06_helper_bars.png", helper_mask)
+    write_png(out_d / "07_rect_candidates.png", rect_mask)
 
     # 8) Save JSON debug
     dbg = {
@@ -356,6 +784,12 @@ def slice_sheet(image_path: Path, out_root: Path):
         "separators": {"center_x": center_x, "right_x": right_x, "header_y": header_y},
         "columns": {"L": list(map(int, colL)), "R": list(map(int, colR))},
         "counts": {"rows_L": len(rows_L), "rows_R": len(rows_R)},
+        "row_detection": {
+            "rect_candidates": rect_dbg,
+            "cluster": cluster_dbg,
+            "L": info_L,
+            "R": info_R,
+        },
         "exported": exported,
         "tuning_hints": {
             "If 02_bin_ink looks flooded (too white)": [
