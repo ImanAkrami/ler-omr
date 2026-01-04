@@ -36,20 +36,8 @@ def process_single_file(image_path: Path, input_dir: Path, output_dir: Path, deb
             "overall_status": "failed",
         }
 
-    # Load JSON metadata for Stage-2
-    json_path = input_dir / f"{image_path.stem}.json"
-    if not json_path.exists():
-        return {
-            "image": image_path.name,
-            "stage1_status": "success",
-            "stage2_status": "error",
-            "error": f"JSON metadata not found: {json_path}",
-            "overall_status": "failed",
-        }
-
     # Stage-2: Question slicing
     try:
-        meta = slice_questions.load_meta(json_path)
         crop_path = output_dir / f"{image_path.stem}_crop.png"
 
         if not crop_path.exists():
@@ -66,7 +54,7 @@ def process_single_file(image_path: Path, input_dir: Path, output_dir: Path, deb
         sheet_stem = image_path.stem
         questions_output_root = Path("output") / "questions"
 
-        slice_questions.slice_sheet(crop_path, meta, questions_output_root)
+        slice_questions.slice_sheet(crop_path, questions_output_root)
 
         return {
             "image": image_path.name,
