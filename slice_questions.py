@@ -2,22 +2,15 @@
 """
 Dash-driven OMR row slicer (deterministic, dash-first, snap-to-table-borders)
 
-What we KEEP unchanged:
-- Dash detection logic (your tuned LONG_LINE_H_FRAC=0.60 and DASH_MAX_H_FRAC=0.14)
-- The "avoid morphology merging into one long line" approach
-- Small debug outputs
-- ROI building + snapping behavior that you said works well
+KEEP unchanged:
+- Dash detection logic (LONG_LINE_H_FRAC=0.60, DASH_MAX_H_FRAC=0.14)
+- Avoid merging into one long line
+- ROI building + snapping behavior
+- Post-filters
 
-What we FIX (carefully):
-- Sometimes a thick written stroke is mis-detected as a "dash".
-We add TWO safe filters *after* dash detection (so detect_dashes stays unchanged):
-  A) X-band filter (primary): real dashes must lie in either:
-     - a "middle" vertical column band (spine dashes)
-     - a "right edge" vertical column band (rightmost dashes)
-  B) Column-consistency filter (secondary): once we estimate the 2 dash columns,
-     drop items that are too far from either column center (distance tolerance).
-
-Both filters are conservative and designed to NOT break current good behavior.
+ONLY CHANGE:
+- Make "blackness" threshold stricter by increasing ADAPT_C.
+  This reduces shadow/wrinkle artifacts being considered ink.
 """
 
 import argparse
@@ -38,7 +31,7 @@ RIGHT_COLUMN_IS_FIRST = True  # per your requirement
 # --- Binarization ---
 GAUSS_BLUR = 5
 ADAPT_BLOCK_FRAC = 0.02
-ADAPT_C = 7
+ADAPT_C = 15               # <-- ONLY CHANGE: was 7. Higher = stricter ink (less shadow/wrinkle ink)
 MAX_INK_RATIO = 0.30
 
 # --- Vertical span (ignore header/footer) ---
@@ -64,17 +57,12 @@ DASH_AR_MAX = 20.0
 DASH_FILL_MIN = 0.55
 
 # --- NEW: Dash placement filters (post-detect, very safe) ---
-# Real dashes only appear in two vertical "lanes":
-#   - spine lane (near middle)
-#   - right-edge lane
-# These are fractions of image width. Adjust ONLY if your template changes.
 DASH_X_BANDS = [
     (0.44, 0.62),  # spine/middle dash column band
     (0.86, 0.995), # right-edge dash column band
 ]
-# After we estimate the two column centers, keep only dashes close to one of them.
-DASH_CENTER_MAX_DIST_FRAC = 0.045  # max |cx-center| as fraction of width (conservative)
-DASH_CENTER_MAX_DIST_PX_MIN = 18   # absolute minimum tolerance (phone blur)
+DASH_CENTER_MAX_DIST_FRAC = 0.045
+DASH_CENTER_MAX_DIST_PX_MIN = 18
 
 # --- ROI building ---
 DASH_TO_TABLE_GAP_PX = 4
@@ -155,39 +143,24 @@ def adaptive_binarize(gray):
 # =========================
 
 def detect_dashes(bin_img, y0, y1):
-    """
-    Detect short, thick, SOLID vertical dashes.
-    Returns:
-      kept_dashes: list[dict]  (bbox in FULL image coords)
-      kept_mask_roi: uint8 mask (ROI size) with kept components
-      cleaned_roi: ROI after subtracting long_lines
-      long_lines_roi: ROI of extracted long lines
-      debug: dict
-      rejected: list[dict] (ROI coords)
-    """
     h, w = bin_img.shape
     roi = bin_img[y0:y1, :]
 
-    # 1) Light close to fix jagged edges / tiny holes (won't connect rows if kernel is small)
     k_close = max(3, int(min(h, w) * CLOSE_K_FRAC))
     if k_close % 2 == 0:
         k_close += 1
     close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_close, k_close))
     closed = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, close_kernel, iterations=CLOSE_ITERS)
 
-    # 2) Remove long continuous vertical lines (page borders / continuous strokes)
     k_ll_w = max(1, int(w * LONG_LINE_W_FRAC))
     k_ll_h = max(25, int(h * LONG_LINE_H_FRAC))
     long_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_ll_w, k_ll_h))
     long_lines = cv2.morphologyEx(closed, cv2.MORPH_OPEN, long_kernel, iterations=LONG_LINE_ITERS)
 
-    # Subtract long lines
     cleaned = cv2.subtract(closed, long_lines)
 
-    # 3) Connected components
     num, labels, stats, _ = cv2.connectedComponentsWithStats((cleaned > 0).astype(np.uint8), connectivity=8)
 
-    # thresholds in px (based on FULL image size)
     min_h = int(h * DASH_MIN_H_FRAC)
     max_h = int(h * DASH_MAX_H_FRAC)
     min_w = int(w * DASH_MIN_W_FRAC)
@@ -221,7 +194,7 @@ def detect_dashes(bin_img, y0, y1):
 
         kept_mask[labels == i] = 255
         kept.append({
-            "bbox": [int(x), int(y0 + y), int(x + ww), int(y0 + y + hh)],  # FULL coords
+            "bbox": [int(x), int(y0 + y), int(x + ww), int(y0 + y + hh)],
             "cx": int(x + ww // 2),
             "cy": int(y0 + y + hh // 2),
             "w": int(ww),
@@ -280,10 +253,6 @@ def filter_dashes_by_x_bands(dashes, img_w):
 
 
 def estimate_two_centers_by_kmeans(dashes):
-    """
-    Returns (centers_sorted, labels_ordered_0_1) or (None, None) if not enough dashes.
-    centers_sorted: [left_center_x, right_center_x]
-    """
     if len(dashes) < 2:
         return None, None
 
@@ -294,18 +263,13 @@ def estimate_two_centers_by_kmeans(dashes):
         10, cv2.KMEANS_PP_CENTERS
     )
     centers = centers.flatten()
-    order = np.argsort(centers)  # left then right
+    order = np.argsort(centers)
     centers_sorted = [float(centers[order[0]]), float(centers[order[1]])]
-    # map raw label -> ordered 0/1
     ordered_labels = np.array([0 if lab == order[0] else 1 for lab in labels.flatten()], dtype=np.int32)
     return centers_sorted, ordered_labels
 
 
 def filter_dashes_by_column_consistency(dashes, img_w):
-    """
-    After x-band filtering, we expect two tight columns.
-    We estimate 2 centers and drop dashes too far from both centers.
-    """
     centers, _ = estimate_two_centers_by_kmeans(dashes)
     if centers is None:
         return dashes, [], {"applied": False, "reason": "not_enough_dashes"}
@@ -329,17 +293,9 @@ def filter_dashes_by_column_consistency(dashes, img_w):
 # =========================
 
 def cluster_dashes_two_columns(dashes):
-    """
-    Returns:
-      cols: dict {0: [dash...], 1: [dash...]} ordered by x center (0 = left, 1 = right)
-      centers: (left_center_x, right_center_x)
-      spine_col_index: 0
-      rightmost_col_index: 1
-    """
     if len(dashes) == 0:
         return {0: [], 1: []}, (0.0, 0.0), 0, 1
     if len(dashes) == 1:
-        # can't kmeans; treat as rightmost for safety
         return {0: [], 1: [dashes[0]]}, (0.0, float(dashes[0]["cx"])), 0, 1
 
     xs = np.array([d["cx"] for d in dashes], dtype=np.float32).reshape(-1, 1)
@@ -350,7 +306,7 @@ def cluster_dashes_two_columns(dashes):
     )
 
     centers = centers.flatten()
-    order = np.argsort(centers)  # left then right
+    order = np.argsort(centers)
 
     cols = {0: [], 1: []}
     for d, lab in zip(dashes, labels.flatten()):
@@ -370,12 +326,6 @@ def cluster_dashes_two_columns(dashes):
 # =========================
 
 def _snap_roi_width_to_table(bin_img, y0, y1, x0_coarse, x1_coarse):
-    """
-    Given fixed row height [y0,y1) and a coarse x band,
-    snap to the printed table's vertical borders inside that band.
-
-    Returns (x0_snap, x1_snap, debug_dict)
-    """
     h, w = bin_img.shape
     y0 = int(max(0, min(h - 1, y0)))
     y1 = int(max(y0 + 1, min(h, y1)))
@@ -413,7 +363,7 @@ def _snap_roi_width_to_table(bin_img, y0, y1, x0_coarse, x1_coarse):
         return x0, x1, {"snapped": False, "reason": "bad_span", "left_x": left_x, "right_x": right_x}
 
     x0_snap = x0 + left_x
-    x1_snap = x0 + right_x + 1  # inclusive->exclusive
+    x1_snap = x0 + right_x + 1
 
     return x0_snap, x1_snap, {
         "snapped": True,
@@ -427,10 +377,6 @@ def _snap_roi_width_to_table(bin_img, y0, y1, x0_coarse, x1_coarse):
 
 
 def build_row_rois_from_dashes(bin_img, cols, spine_col_index, rightmost_col_index, w_img):
-    """
-    Height is EXACT dash bbox height.
-    Width: coarse band per column, then snap to table borders.
-    """
     spine_x_right = None
     if len(cols.get(spine_col_index, [])) > 0:
         spine_x_right = int(max(d["bbox"][2] for d in cols[spine_col_index]))
@@ -495,7 +441,6 @@ def draw_dashes_overlay(img_bgr, y0, y1, kept, rejected, dropped_post=None):
         x0, yy0, x1, yy1 = r["bbox"]
         cv2.rectangle(overlay, (x0, y0 + yy0), (x1, y0 + yy1), (0, 0, 255), 1)
 
-    # NEW: post-filter dropped dashes (orange)
     if dropped_post:
         for d in dropped_post[:200]:
             x0, yy0, x1, yy1 = d["bbox"]
@@ -511,11 +456,11 @@ def draw_dashes_and_rois_overlay(img_bgr, items, split_x=None):
 
     for it in items:
         x0, y0, x1, y1 = it["coarse"]
-        cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 0, 255), 2)      # purple: coarse
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 0, 255), 2)
         x0, y0, x1, y1 = it["roi"]
-        cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 255, 0), 2)      # cyan: snapped
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 255, 0), 2)
         dx0, dy0, dx1, dy1 = it["dash"]["bbox"]
-        cv2.rectangle(overlay, (dx0, dy0), (dx1, dy1), (0, 255, 0), 2)    # green: dash
+        cv2.rectangle(overlay, (dx0, dy0), (dx1, dy1), (0, 255, 0), 2)
 
     return overlay
 
@@ -544,12 +489,8 @@ def run(image_path: Path, out_root: Path):
     y0 = int(h * TOP_IGNORE_FRAC)
     y1 = int(h * (1.0 - BOTTOM_IGNORE_FRAC))
 
-    # Detect dashes (unchanged)
     kept, kept_mask_roi, cleaned_roi, long_lines_roi, dash_debug, rejected = detect_dashes(bin_img, y0, y1)
 
-    # -------------------------
-    # NEW: post-filters for false dashes
-    # -------------------------
     kept_band, dropped_band = filter_dashes_by_x_bands(kept, w)
     kept_final, dropped_center, center_dbg = filter_dashes_by_column_consistency(kept_band, w)
     dropped_post = dropped_band + dropped_center
@@ -571,19 +512,16 @@ def run(image_path: Path, out_root: Path):
         },
     }
 
-    kept = kept_final  # <- important: from here onward, we only use filtered dashes
+    kept = kept_final
 
-    # Cluster into 2 dash columns (spine + right edge)
     cols, centers, spine_col_index, rightmost_col_index = cluster_dashes_two_columns(kept)
 
     split_x = None
     if centers[0] > 0 and centers[1] > 0:
         split_x = int((centers[0] + centers[1]) * 0.5)
 
-    # Build row ROIs
     items = build_row_rois_from_dashes(bin_img, cols, spine_col_index, rightmost_col_index, w)
 
-    # Ordering + naming
     right_items = [it for it in items if it["col"] == "R"]
     left_items = [it for it in items if it["col"] == "L"]
     right_items.sort(key=lambda it: it["dash"]["cy"])
@@ -613,7 +551,6 @@ def run(image_path: Path, out_root: Path):
         })
         q_index += 1
 
-    # Build full-size masks for easier viewing
     kept_mask_full = np.zeros((h, w), dtype=np.uint8)
     kept_mask_full[y0:y1, :] = kept_mask_roi
 
@@ -623,7 +560,6 @@ def run(image_path: Path, out_root: Path):
     long_full = np.zeros((h, w), dtype=np.uint8)
     long_full[y0:y1, :] = long_lines_roi
 
-    # Debug overlays
     dashes_overlay = draw_dashes_overlay(img, y0, y1, kept, rejected, dropped_post=dropped_post)
     dashes_and_rois_overlay = draw_dashes_and_rois_overlay(img, ordered, split_x=split_x)
 
