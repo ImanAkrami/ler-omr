@@ -237,7 +237,7 @@ def find_corner_in_roi(thick_mask: np.ndarray, roi: Tuple[int, int, int, int], c
     color = cv2.cvtColor(roi_mask, cv2.COLOR_GRAY2BGR)
     contours, _ = cv2.findContours(comp_mask_full, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(color, contours, -1, (0, 0, 255), 2)
-    write_debug_image(color, debug_dir / f"{stem}_roi_{corner}_comp.png")
+    write_debug_image(color, debug_dir / f"stage1_roi_{corner}_comp.png")
 
     # Use deterministic outer vertex method (primary)
     point = outer_vertex_from_component(comp_mask_full, rx, ry, corner)
@@ -337,9 +337,9 @@ def find_corner_in_roi(thick_mask: np.ndarray, roi: Tuple[int, int, int, int], c
 
     # If fallback was used, save additional debug image
     if picked_method == "fallback_windowed_extrema":
-        write_debug_image(picked_color, debug_dir / f"{stem}_roi_{corner}_picked_fallback.png")
+        write_debug_image(picked_color, debug_dir / f"stage1_roi_{corner}_picked_fallback.png")
     else:
-        write_debug_image(picked_color, debug_dir / f"{stem}_roi_{corner}_picked.png")
+        write_debug_image(picked_color, debug_dir / f"stage1_roi_{corner}_picked.png")
 
     return point, component_debug
 
@@ -397,11 +397,15 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
     if image is None:
         raise ValueError(f"Failed to read image {path}")
 
+    # Stage 1 debug directory
+    stage1_debug_dir = debug_dir / "stage1"
+    stage1_debug_dir.mkdir(parents=True, exist_ok=True)
+
     height, width = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     processed = preprocess(gray)
-    write_debug_image(processed["binary"], debug_dir / f"{path.stem}_mask_binary.png")
-    write_debug_image(processed["thick"], debug_dir / f"{path.stem}_mask_thick.png")
+    write_debug_image(processed["binary"], stage1_debug_dir / "stage1_mask_binary.png")
+    write_debug_image(processed["thick"], stage1_debug_dir / "stage1_mask_thick.png")
 
     rois = extract_rois(width, height)
     image_center = (width / 2.0, height / 2.0)
@@ -409,7 +413,7 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
     component_logs: Dict[str, Dict] = {}
 
     for corner_name, roi in rois.items():
-        pt, comp_dbg = find_corner_in_roi(processed["thick"], roi, corner_name, image_center, debug_dir, path.stem, width, height)
+        pt, comp_dbg = find_corner_in_roi(processed["thick"], roi, corner_name, image_center, stage1_debug_dir, "stage1", width, height)
         corners[corner_name] = pt
         component_logs[corner_name] = comp_dbg
 
@@ -417,11 +421,11 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
     missing_corners = [name for name, pt in corners.items() if pt is None]
     if missing_corners:
         processed_alt = preprocess_alternative(gray)
-        write_debug_image(processed_alt["thick"], debug_dir / f"{path.stem}_mask_thick_alt.png")
+        write_debug_image(processed_alt["thick"], stage1_debug_dir / "stage1_mask_thick_alt.png")
 
         for corner_name in missing_corners:
             roi = rois[corner_name]
-            pt, comp_dbg = find_corner_in_roi(processed_alt["thick"], roi, corner_name, image_center, debug_dir, path.stem, width, height)
+            pt, comp_dbg = find_corner_in_roi(processed_alt["thick"], roi, corner_name, image_center, stage1_debug_dir, "stage1", width, height)
             if pt is not None:  # Only update if we found something
                 corners[corner_name] = pt
                 component_logs[corner_name] = comp_dbg
@@ -454,10 +458,10 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
     if any(pt is None for pt in found_points):
         found_count = sum(pt is not None for pt in found_points)
         debug_data["status"] = f"fail_missing ({found_count}/4)"
-        write_debug_image(overlay, debug_dir / f"{path.stem}_debug_rois_and_points.png")
-        with open(debug_dir / f"{path.stem}_data.json", "w", encoding="utf-8") as fp:
+        write_debug_image(overlay, stage1_debug_dir / "stage1_rois_and_points.png")
+        with open(stage1_debug_dir / "stage1_data.json", "w", encoding="utf-8") as fp:
             json.dump(debug_data, fp, indent=2)
-        return debug_data
+        return debug_data, None
 
     ordered_corners = np.array(found_points, dtype=np.float32)
     inset = max(10, int(INSET_FRAC * min(width, height)))
@@ -472,13 +476,13 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
     aspect_after = warped_fixed_w / warped_fixed_h
 
     cv2.polylines(overlay, [np.array(inset_corners, dtype=np.int32)], True, (255, 0, 255), 3)
-    write_debug_image(overlay, debug_dir / f"{path.stem}_debug_rois_and_points.png")
-    write_debug_image(overlay, debug_dir / f"{path.stem}_debug_final_quad.png")
-    cv2.imwrite(str(output_dir / f"{path.stem}_crop.png"), warped_fixed)
+    write_debug_image(overlay, stage1_debug_dir / "stage1_rois_and_points.png")
+    write_debug_image(overlay, stage1_debug_dir / "stage1_final_quad.png")
+    cv2.imwrite(str(output_dir / "crop.png"), warped_fixed)
 
     # Save debug image if ratio fix was applied
     if ratio_fix_applied:
-        write_debug_image(warped_fixed, debug_dir / f"{path.stem}_crop_ratio_fixed.png")
+        write_debug_image(warped_fixed, stage1_debug_dir / "stage1_crop_ratio_fixed.png")
 
     debug_data.update(
         {
@@ -496,8 +500,8 @@ def process_image(path: Path, output_dir: Path, debug_dir: Path) -> Dict:
         }
     )
 
-    with open(debug_dir / f"{path.stem}_data.json", "w", encoding="utf-8") as fp:
+    with open(stage1_debug_dir / "stage1_data.json", "w", encoding="utf-8") as fp:
         json.dump(debug_data, fp, indent=2)
 
-    return debug_data
+    return debug_data, warped_fixed
 

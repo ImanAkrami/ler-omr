@@ -8,16 +8,18 @@ import main_processor
 class ProcessOmrMarkersIntegrationTest(unittest.TestCase):
     def test_all_sample_inputs_process_successfully(self) -> None:
         input_dir = Path("inputs")
-        output_dir = Path("output/test_crops")
-        debug_dir = Path("output/test_debug")
+        output_root = Path("output")
 
-        shutil.rmtree(output_dir, ignore_errors=True)
-        shutil.rmtree(debug_dir, ignore_errors=True)
+        # Clean up old test outputs
+        if output_root.exists():
+            for item in output_root.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
 
         # Process each image file individually
         results = {}
         for image_path in sorted(input_dir.glob("*.jpg")):
-            result = main_processor.process_single_file(image_path, input_dir, output_dir, debug_dir)
+            result = main_processor.process_single_file(image_path, input_dir, output_root)
             results[image_path.name] = result["overall_status"]
 
         photographed = {

@@ -11,11 +11,17 @@ KEEP unchanged:
 ONLY CHANGE:
 - Make "blackness" threshold stricter by increasing ADAPT_C.
   This reduces shadow/wrinkle artifacts being considered ink.
+
+MINIMAL FIX (NEW):
+- In snapping, avoid smudge peaks near band edges:
+  - left border: choose RIGHTMOST peak inside left search zone (instead of leftmost)
+  - right border: choose LEFTMOST peak inside right search zone (instead of rightmost)
 """
 
 import argparse
 import json
 from pathlib import Path
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -25,13 +31,12 @@ import numpy as np
 # PARAMETERS (tunable, safe)
 # =========================
 
-# Output naming
-RIGHT_COLUMN_IS_FIRST = True  # per your requirement
+RIGHT_COLUMN_IS_FIRST = True
 
 # --- Binarization ---
 GAUSS_BLUR = 5
 ADAPT_BLOCK_FRAC = 0.02
-ADAPT_C = 15               # <-- ONLY CHANGE: was 7. Higher = stricter ink (less shadow/wrinkle ink)
+ADAPT_C = 15
 MAX_INK_RATIO = 0.30
 
 # --- Vertical span (ignore header/footer) ---
@@ -42,24 +47,24 @@ BOTTOM_IGNORE_FRAC = 0.02
 CLOSE_K_FRAC = 0.004
 CLOSE_ITERS = 1
 
-# --- Long vertical line removal (prevents "one long line" mask) ---
+# --- Long vertical line removal ---
 LONG_LINE_W_FRAC = 0.008
-LONG_LINE_H_FRAC = 0.60  # tuned
+LONG_LINE_H_FRAC = 0.60
 LONG_LINE_ITERS = 1
 
 # --- Dash candidate geometry ---
 DASH_MIN_H_FRAC = 0.012
-DASH_MAX_H_FRAC = 0.14    # tuned
+DASH_MAX_H_FRAC = 0.14
 DASH_MIN_W_FRAC = 0.002
 DASH_MAX_W_FRAC = 0.050
 DASH_AR_MIN = 1.15
 DASH_AR_MAX = 20.0
 DASH_FILL_MIN = 0.55
 
-# --- NEW: Dash placement filters (post-detect, very safe) ---
+# --- Post-filter dash placement ---
 DASH_X_BANDS = [
-    (0.44, 0.62),  # spine/middle dash column band
-    (0.86, 0.995), # right-edge dash column band
+    (0.44, 0.62),   # spine
+    (0.86, 0.995),  # right edge
 ]
 DASH_CENTER_MAX_DIST_FRAC = 0.045
 DASH_CENTER_MAX_DIST_PX_MIN = 18
@@ -230,7 +235,7 @@ def detect_dashes(bin_img, y0, y1):
 
 
 # =========================
-# NEW: POST-FILTER dashes (safe)
+# POST-FILTER dashes (unchanged)
 # =========================
 
 def _in_any_x_band(cx, w):
@@ -289,7 +294,7 @@ def filter_dashes_by_column_consistency(dashes, img_w):
 
 
 # =========================
-# DASH CLUSTERING (2 columns)
+# DASH CLUSTERING (unchanged)
 # =========================
 
 def cluster_dashes_two_columns(dashes):
@@ -322,7 +327,7 @@ def cluster_dashes_two_columns(dashes):
 
 
 # =========================
-# ROI WIDTH SNAPPING
+# ROI WIDTH SNAPPING (MINIMAL FIX HERE)
 # =========================
 
 def _snap_roi_width_to_table(bin_img, y0, y1, x0_coarse, x1_coarse):
@@ -356,11 +361,34 @@ def _snap_roi_width_to_table(bin_img, y0, y1, x0_coarse, x1_coarse):
     left_cand = cand[cand <= max(1, left_lim)]
     right_cand = cand[cand >= min(band_w - 2, right_lim)]
 
-    left_x = int(left_cand.min()) if left_cand.size else int(cand.min())
-    right_x = int(right_cand.max()) if right_cand.size else int(cand.max())
+    # ----------------------------
+    # MINIMAL SAFETY CHANGE:
+    # - left border: choose RIGHTMOST peak in left window (avoids smudge near x=0)
+    # - right border: choose LEFTMOST peak in right window (avoids smudge at far-right)
+    # ----------------------------
+    if left_cand.size:
+        left_x = int(left_cand.max())
+        left_pick = "left_window_max"
+    else:
+        left_x = int(cand.min())
+        left_pick = "global_min"
+
+    if right_cand.size:
+        right_x = int(right_cand.min())
+        right_pick = "right_window_min"
+    else:
+        right_x = int(cand.max())
+        right_pick = "global_max"
 
     if right_x <= left_x + 5:
-        return x0, x1, {"snapped": False, "reason": "bad_span", "left_x": left_x, "right_x": right_x}
+        return x0, x1, {
+            "snapped": False,
+            "reason": "bad_span",
+            "left_x": int(left_x),
+            "right_x": int(right_x),
+            "left_pick": left_pick,
+            "right_pick": right_pick,
+        }
 
     x0_snap = x0 + left_x
     x1_snap = x0 + right_x + 1
@@ -373,6 +401,10 @@ def _snap_roi_width_to_table(bin_img, y0, y1, x0_coarse, x1_coarse):
         "kernel": [int(VERT_OPEN_W_PX), int(k_h)],
         "left_x_in_band": int(left_x),
         "right_x_in_band": int(right_x),
+        "left_pick": left_pick,
+        "right_pick": right_pick,
+        "left_lim": int(left_lim),
+        "right_lim": int(right_lim),
     }
 
 
@@ -426,7 +458,7 @@ def build_row_rois_from_dashes(bin_img, cols, spine_col_index, rightmost_col_ind
 
 
 # =========================
-# DEBUG DRAWING
+# DEBUG DRAWING (unchanged)
 # =========================
 
 def draw_dashes_overlay(img_bgr, y0, y1, kept, rejected, dropped_post=None):
@@ -466,23 +498,27 @@ def draw_dashes_and_rois_overlay(img_bgr, items, split_x=None):
 
 
 # =========================
-# MAIN
+# METADATA
 # =========================
 
-def run(image_path: Path, out_root: Path):
-    img = cv2.imread(str(image_path))
-    if img is None:
-        raise RuntimeError(f"Failed to load image: {image_path}")
+def load_metadata(json_path: Optional[Path]) -> Optional[Dict]:
+    if json_path is None or not json_path.exists():
+        return None
+    return json.loads(json_path.read_text())
 
+
+# =========================
+# MAIN (stage2 writer kept)
+# =========================
+
+def slice_questions(img: np.ndarray, file_output_dir: Path, stem: str, metadata: Optional[Dict] = None):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
 
-    stem = image_path.stem
-    out_dir = out_root / stem
-    q_dir = out_dir / "questions"
-    d_dir = out_dir / "debug"
+    q_dir = file_output_dir / "questions"
+    stage2_debug_dir = file_output_dir / "debug" / "stage2"
+    stage2_debug_dir.mkdir(parents=True, exist_ok=True)
     q_dir.mkdir(parents=True, exist_ok=True)
-    d_dir.mkdir(parents=True, exist_ok=True)
 
     bin_img, bin_info = adaptive_binarize(gray)
 
@@ -528,6 +564,12 @@ def run(image_path: Path, out_root: Path):
     left_items.sort(key=lambda it: it["dash"]["cy"])
     ordered = right_items + left_items if RIGHT_COLUMN_IS_FIRST else left_items + right_items
 
+    questions_map = {}
+    if metadata and "questions" in metadata:
+        for q in metadata["questions"]:
+            questions_map[q["questionNumber"]] = q
+
+    question_crops = []
     exported = []
     q_index = 1
     for it in ordered:
@@ -538,7 +580,24 @@ def run(image_path: Path, out_root: Path):
 
         col = it["col"]
         name = f"Q{q_index}-Col-{col}.png"
-        cv2.imwrite(str(q_dir / name), crop, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+        crop_path = q_dir / name
+        cv2.imwrite(str(crop_path), crop, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+
+        question_meta = questions_map.get(q_index)
+        question_type = question_meta.get("type") if question_meta is not None else None
+
+        question_crops.append({
+            "crop": crop.copy(),
+            "q_index": int(q_index),
+            "col": col,
+            "name": name,
+            "roi": [int(x0r), int(y0r), int(x1r), int(y1r)],
+            "coarse": it["coarse"],
+            "dash": it["dash"]["bbox"],
+            "snap_debug": it["snap_debug"],
+            "question_meta": question_meta,
+            "question_type": question_type,
+        })
 
         exported.append({
             "q": int(q_index),
@@ -549,6 +608,7 @@ def run(image_path: Path, out_root: Path):
             "dash": it["dash"]["bbox"],
             "snap_debug": it["snap_debug"],
         })
+
         q_index += 1
 
     kept_mask_full = np.zeros((h, w), dtype=np.uint8)
@@ -573,11 +633,11 @@ def run(image_path: Path, out_root: Path):
         else:
             cv2.imwrite(str(path), small, [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION])
 
-    save_small(d_dir / "dashes_overlay_small.jpg", dashes_overlay, True)
-    save_small(d_dir / "dashes_and_rois_overlay_small.jpg", dashes_and_rois_overlay, True)
-    save_small(d_dir / "dash_mask_small.png", kept_mask_full, False)
-    save_small(d_dir / "cleaned_small.png", cleaned_full, False)
-    save_small(d_dir / "long_lines_small.png", long_full, False)
+    save_small(stage2_debug_dir / "stage2_dashes_overlay.jpg", dashes_overlay, True)
+    save_small(stage2_debug_dir / "stage2_dashes_and_rois_overlay.jpg", dashes_and_rois_overlay, True)
+    save_small(stage2_debug_dir / "stage2_dash_mask.png", kept_mask_full, False)
+    save_small(stage2_debug_dir / "stage2_cleaned.png", cleaned_full, False)
+    save_small(stage2_debug_dir / "stage2_long_lines.png", long_full, False)
 
     data = {
         "image": {"w": int(w), "h": int(h)},
@@ -594,23 +654,36 @@ def run(image_path: Path, out_root: Path):
         },
         "exported": exported,
         "outputs": {
-            "dashes_overlay": "debug/dashes_overlay_small.jpg",
-            "dashes_and_rois_overlay": "debug/dashes_and_rois_overlay_small.jpg",
-            "dash_mask": "debug/dash_mask_small.png",
-            "cleaned": "debug/cleaned_small.png",
-            "long_lines": "debug/long_lines_small.png",
+            "dashes_overlay": "debug/stage2/stage2_dashes_overlay.jpg",
+            "dashes_and_rois_overlay": "debug/stage2/stage2_dashes_and_rois_overlay.jpg",
+            "dash_mask": "debug/stage2/stage2_dash_mask.png",
+            "cleaned": "debug/stage2/stage2_cleaned.png",
+            "long_lines": "debug/stage2/stage2_long_lines.png",
             "questions_dir": "questions/",
         },
     }
-    (out_dir / "data.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    (stage2_debug_dir / "stage2_data.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    return question_crops, data
+
+
+def run(image_path: Path, out_root: Path, metadata_path: Optional[Path] = None):
+    img = cv2.imread(str(image_path))
+    if img is None:
+        raise RuntimeError(f"Failed to load image: {image_path}")
+
+    metadata = load_metadata(metadata_path)
+    return slice_questions(img, out_root, image_path.stem, metadata)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--metadata", type=Path, help="Path to JSON metadata file")
     args = ap.parse_args()
-    run(args.image, args.out)
+    run(args.image, args.out, args.metadata)
 
 
 if __name__ == "__main__":
