@@ -1,813 +1,617 @@
+#!/usr/bin/env python3
 """
-Simple + robust OMR row slicer (two-column) using:
-- adaptive binarization with auto polarity selection (prevents "everything white" failures)
-- morphological extraction of vertical separators (center + right border)
-- morphological extraction of horizontal row lines, then y-projection peaks
-- row rectangles = between consecutive horizontal lines inside each column ROI
+Dash-driven OMR row slicer (deterministic, dash-first, snap-to-table-borders)
 
-Outputs:
-out/<stem>/questions/colL_row_###.png
-out/<stem>/questions/colR_row_###.png
-out/<stem>/debug/*.png and overlays + data.json
+What we KEEP unchanged:
+- Dash detection logic (your tuned LONG_LINE_H_FRAC=0.60 and DASH_MAX_H_FRAC=0.14)
+- The "avoid morphology merging into one long line" approach
+- Small debug outputs
 
-Usage:
-python omr_slice_simple.py --image /path/to/crop.png --out out_dir
+What we ADD:
+1) Cluster dashes into 2 X-columns (spine/right-edge)
+2) Build one row ROI per dash using the dash bbox height EXACTLY (y0..y1 = dash bbox)
+3) For each row, compute a *coarse* horizontal search band that cannot leak into the other column:
+   - If dash is rightmost column: search band starts just right of the spine-dash column and ends just left of this dash
+   - If dash is spine column: search band starts at page left and ends just left of this dash
+4) Inside that band, snap ROI width to printed table vertical borders by detecting strong vertical strokes
+5) Export crops + overlay:
+   - debug/dashes_overlay_small.jpg  (kept dashes)
+   - debug/dashes_and_rois_overlay_small.jpg (coarse band = purple, snapped ROI = cyan, dash bbox = green)
+   - debug/dash_mask_small.png (kept dashes mask)
+   - debug/cleaned_small.png, debug/long_lines_small.png
+6) Naming:
+   - Right column is ALWAYS FIRST (constant RIGHT_COLUMN_IS_FIRST=True)
+   - Global numbering starts at 1: Q1-Col-R, Q2-Col-R, ... then continues on left column: Q{n+1}-Col-L...
+
+Notes:
+- Height is strictly dash bbox height (no height padding).
+- Width snapping uses vertical-line projection within the row band; very constrained so it won't grab the other column.
 """
 
 import argparse
 import json
 from pathlib import Path
-from typing import List, Tuple, Dict
 
 import cv2
 import numpy as np
 
 
-# -------------------------
-# Tunable parameters
-# -------------------------
+# =========================
+# PARAMETERS (tunable, safe)
+# =========================
 
-# Binarization
-GAUSS_BLUR_K = 5
-ADAPTIVE_METHOD = cv2.ADAPTIVE_THRESH_GAUSSIAN_C
-ADAPTIVE_BLOCK_FRAC = 0.02  # block size ~ 2% of min(h,w), forced odd and >= 31
-ADAPTIVE_C = 7              # try 5..15
-FG_RATIO_MAX = 0.20         # if foreground ratio too high -> pick the other polarity
+# Output naming
+RIGHT_COLUMN_IS_FIRST = True  # per your requirement
 
-# Vertical separator detection
-VERT_KERNEL_W_FRAC = 0.006  # thin vertical kernel width ~0.6% of width
-VERT_KERNEL_H_FRAC = 0.20   # tall vertical kernel height ~20% of height
-CENTER_BAND = (0.30, 0.70)  # search for center divider in this x range
-RIGHT_BAND = (0.80, 0.98)   # search for right border in this x range
+# --- Binarization ---
+GAUSS_BLUR = 5
+ADAPT_BLOCK_FRAC = 0.02
+ADAPT_C = 7
+MAX_INK_RATIO = 0.30
 
-# Column ROIs
-PAGE_MARGIN_FRAC = 0.015
-SEP_PAD_FRAC = 0.010        # padding away from center divider to avoid bleed
-RIGHT_BORDER_PAD_FRAC = 0.010
+# --- Vertical span (ignore header/footer) ---
+TOP_IGNORE_FRAC = 0.10
+BOTTOM_IGNORE_FRAC = 0.02
 
-# Horizontal row line detection
-HORIZ_KERNEL_W_FRAC = 0.18  # wide horizontal kernel ~18% of width
-HORIZ_KERNEL_H = 1
-ROW_PEAK_THRESH = 0.35      # relative peak threshold
-ROW_CLUSTER_TOL_PX = 6       # cluster close peaks
-MIN_ROW_H_FRAC = 0.012       # discard ultra tiny rows
+# --- Pre-clean (do NOT connect rows) ---
+CLOSE_K_FRAC = 0.004
+CLOSE_ITERS = 1
 
-# Question box contour detection
-RECT_MIN_W_FRAC_IMG = 0.26   # min width relative to image width
-RECT_MAX_W_FRAC_IMG = 0.70   # max width relative to image width (keeps us inside a column)
-RECT_MIN_H_FRAC_IMG = 0.012  # min height relative to image height
-RECT_MAX_H_FRAC_IMG = 0.20   # max height relative to image height (supports long open questions)
-RECT_ASPECT_MIN = 3.0        # w/h lower bound
-RECT_ASPECT_MAX = 25.0       # w/h upper bound
-RECT_CLOSE_K = (5, 5)        # closing kernel before contour detection
-RECT_Y_MERGE_GAP_PX = 6      # merge close rectangles
-RECT_MIN_PER_COL = 18        # if fewer than this, try helper/horiz fallback
+# --- Long vertical line removal (prevents "one long line" mask) ---
+LONG_LINE_W_FRAC = 0.008
+LONG_LINE_H_FRAC = 0.60  # your tuned value
+LONG_LINE_ITERS = 1
 
-# Helper bar (thick right strip inside each question)
-BAR_BAND_FRAC = 0.18         # portion (from the right of a column) to search for the helper bar
-BAR_MIN_W_FRAC = 0.01        # minimum helper bar width relative to column width
-BAR_MIN_H_FRAC = 0.012       # minimum helper bar height relative to column height
-BAR_MIN_AREA_FRAC = 0.00025  # min area relative to column area
-BAR_MERGE_GAP_FRAC = 0.004   # merge neighbouring helper fragments separated by small gaps
-BAR_CORE_W_FRAC = 0.32       # keep only the densest vertical slice inside the helper band
-BAR_Y_THRESH_FRAC = 0.08     # threshold relative to peak y-projection
-BAR_CLOSE_KH = 13            # vertical closing kernel to seal tiny holes inside the bar
+# --- Dash candidate geometry ---
+DASH_MIN_H_FRAC = 0.012
+DASH_MAX_H_FRAC = 0.14    # your tuned value
+DASH_MIN_W_FRAC = 0.002
+DASH_MAX_W_FRAC = 0.050
+DASH_AR_MIN = 1.15
+DASH_AR_MAX = 20.0
+DASH_FILL_MIN = 0.55
 
-# Cropping
-NUMBER_STRIP_FRAC = 0.14     # remove question-number strip on right side of each row (inside column)
-ROW_INSET_Y_FRAC = 0.02      # small inset inside row boundaries
-ROW_INSET_X_FRAC = 0.01
+# --- ROI building ---
+DASH_TO_TABLE_GAP_PX = 4          # crop ends this many px before dash x0
+INTER_COL_GAP_PAD_PX = 10         # for right column: start after spine-dash column + this pad
+LEFT_PAGE_PAD_PX = 4              # for left column: small pad from page edge
+MIN_ROI_WIDTH_FRAC = 0.18         # if snapping fails, ensure a minimum width
+MAX_ROI_WIDTH_FRAC = 0.49         # if snapping goes crazy, cap width (per column)
 
-# Debug
-PNG_COMPRESSION = 3
+# --- Vertical line snapping inside row band ---
+# We detect strong vertical strokes in the coarse band to snap left/right borders.
+VERT_OPEN_W_PX = 3
+VERT_OPEN_H_FRAC_OF_ROW = 0.80    # kernel height relative to row height
+VERT_PEAK_MIN_FRAC = 0.55         # x-projection threshold relative to row height
+RIGHT_BORDER_SEARCH_FRAC = 0.22   # search last 22% of band for right border
+LEFT_BORDER_SEARCH_FRAC = 0.22    # search first 22% of band for left border
+
+# --- Debug outputs ---
+DEBUG_SCALE = 0.35
+JPG_QUALITY = 75
+PNG_COMPRESSION = 6
 
 
-# -------------------------
-# Helpers
-# -------------------------
+# =========================
+# HELPERS
+# =========================
 
-def _odd_at_least(v: int, mn: int) -> int:
-    v = max(mn, v)
-    if v % 2 == 0:
-        v += 1
-    return v
+def odd_at_least(v, mn):
+    v = max(mn, int(v))
+    return v + 1 if v % 2 == 0 else v
 
-def write_png(path: Path, img: np.ndarray):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(path), img, [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION])
 
-def to_gray(img: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-
-def binarize_auto(gray: np.ndarray) -> Tuple[np.ndarray, Dict]:
+def adaptive_binarize(gray):
     """
-    Adaptive threshold in BOTH polarities, then choose the one
-    whose foreground ratio is reasonable (not "everything is foreground").
+    Returns bin_img where ink is 255 and background 0.
     """
-    h, w = gray.shape[:2]
-    k = _odd_at_least(int(min(h, w) * ADAPTIVE_BLOCK_FRAC), 31)
-    blur = cv2.GaussianBlur(gray, (GAUSS_BLUR_K, GAUSS_BLUR_K), 0)
+    h, w = gray.shape
+    k = odd_at_least(min(h, w) * ADAPT_BLOCK_FRAC, 31)
+    blur = cv2.GaussianBlur(gray, (GAUSS_BLUR, GAUSS_BLUR), 0)
 
     bin_inv = cv2.adaptiveThreshold(
-        blur, 255, ADAPTIVE_METHOD, cv2.THRESH_BINARY_INV, k, ADAPTIVE_C
+        blur, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        k, ADAPT_C
     )
     bin_norm = cv2.adaptiveThreshold(
-        blur, 255, ADAPTIVE_METHOD, cv2.THRESH_BINARY, k, ADAPTIVE_C
+        blur, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        k, ADAPT_C
     )
 
-    # We want "ink/lines" = 255 in our working binary.
-    # If we use THRESH_BINARY_INV, ink becomes 255. If we use THRESH_BINARY, background becomes 255.
-    # So compute a heuristic: ink ratio should be "smallish".
     inv_ratio = float(np.mean(bin_inv > 0))
-    # For bin_norm, ink is 0, so invert for ratio:
     norm_ratio = float(np.mean((255 - bin_norm) > 0))
 
-    # Choose the polarity with smaller (more sane) ink ratio, but not too tiny.
-    # (Sheets with lots of lines still have ink ratio well below ~0.2)
-    pick_inv = True
-    if inv_ratio > FG_RATIO_MAX and norm_ratio < inv_ratio:
-        pick_inv = False
-
-    if pick_inv:
+    if inv_ratio <= MAX_INK_RATIO:
         chosen = bin_inv
-        ink_ratio = inv_ratio
         polarity = "INV"
-        # chosen already has ink=255
-        work = chosen
+        chosen_ratio = inv_ratio
     else:
-        chosen = bin_norm
-        ink_ratio = norm_ratio
+        chosen = 255 - bin_norm
         polarity = "NORM"
-        # convert to ink=255
-        work = 255 - chosen
+        chosen_ratio = norm_ratio
 
     info = {
-        "adaptive_block": k,
-        "adaptive_C": ADAPTIVE_C,
+        "block": int(k),
+        "C": int(ADAPT_C),
+        "polarity": polarity,
         "inv_ink_ratio": inv_ratio,
         "norm_ink_ratio": norm_ratio,
-        "chosen_polarity": polarity,
-        "chosen_ink_ratio": ink_ratio,
+        "chosen_ink_ratio": chosen_ratio,
+        "max_ink_ratio": float(MAX_INK_RATIO),
     }
-    return work, info
+    return chosen, info
 
-def morph_vertical(bin_ink: np.ndarray) -> np.ndarray:
-    h, w = bin_ink.shape[:2]
-    kw = max(1, int(w * VERT_KERNEL_W_FRAC))
-    kh = max(15, int(h * VERT_KERNEL_H_FRAC))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
-    vert = cv2.morphologyEx(bin_ink, cv2.MORPH_OPEN, kernel)
-    return vert
 
-def morph_horizontal(bin_ink: np.ndarray) -> np.ndarray:
-    h, w = bin_ink.shape[:2]
-    kw = max(25, int(w * HORIZ_KERNEL_W_FRAC))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, HORIZ_KERNEL_H))
-    horiz = cv2.morphologyEx(bin_ink, cv2.MORPH_OPEN, kernel)
-    return horiz
+# =========================
+# DASH DETECTION (UNCHANGED)
+# =========================
 
-def x_peak(vert: np.ndarray, x0f: float, x1f: float) -> int:
-    h, w = vert.shape[:2]
-    x0 = int(w * x0f)
-    x1 = int(w * x1f)
-    proj = vert.sum(axis=0).astype(np.float32)
-    band = proj[x0:x1]
-    if band.size == 0:
-        return w // 2
-    idx = int(np.argmax(band))
-    return x0 + idx
+def detect_dashes(bin_img, y0, y1):
+    """
+    Detect short, thick, SOLID vertical dashes.
+    Returns:
+      kept_dashes: list[dict]  (bbox in FULL image coords)
+      kept_mask_roi: uint8 mask (ROI size) with kept components
+      cleaned_roi: ROI after subtracting long_lines
+      long_lines_roi: ROI of extracted long lines
+      debug: dict
+      rejected: list[dict] (ROI coords)
+    """
+    h, w = bin_img.shape
+    roi = bin_img[y0:y1, :]
 
-def find_two_separators(vert: np.ndarray) -> Tuple[int, int, Dict]:
+    # 1) Light close to fix jagged edges / tiny holes (won't connect rows if kernel is small)
+    k_close = max(3, int(min(h, w) * CLOSE_K_FRAC))
+    if k_close % 2 == 0:
+        k_close += 1
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_close, k_close))
+    closed = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, close_kernel, iterations=CLOSE_ITERS)
+
+    # 2) Remove long continuous vertical lines (page borders / continuous strokes)
+    k_ll_w = max(1, int(w * LONG_LINE_W_FRAC))
+    k_ll_h = max(25, int(h * LONG_LINE_H_FRAC))
+    long_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_ll_w, k_ll_h))
+    long_lines = cv2.morphologyEx(closed, cv2.MORPH_OPEN, long_kernel, iterations=LONG_LINE_ITERS)
+
+    # Subtract long lines
+    cleaned = cv2.subtract(closed, long_lines)
+
+    # 3) Connected components
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((cleaned > 0).astype(np.uint8), connectivity=8)
+
+    # thresholds in px (note: based on FULL image size like your version)
+    min_h = int(h * DASH_MIN_H_FRAC)
+    max_h = int(h * DASH_MAX_H_FRAC)
+    min_w = int(w * DASH_MIN_W_FRAC)
+    max_w = int(w * DASH_MAX_W_FRAC)
+
+    kept = []
+    rejected = []
+    kept_mask = np.zeros_like(cleaned, dtype=np.uint8)
+
+    for i in range(1, num):
+        x, y, ww, hh, area = stats[i]
+        if ww <= 0 or hh <= 0:
+            continue
+
+        if hh < min_h or hh > max_h:
+            rejected.append({"reason": "h", "bbox": [int(x), int(y), int(x + ww), int(y + hh)]})
+            continue
+        if ww < min_w or ww > max_w:
+            rejected.append({"reason": "w", "bbox": [int(x), int(y), int(x + ww), int(y + hh)]})
+            continue
+
+        ar = hh / max(ww, 1)
+        if ar < DASH_AR_MIN or ar > DASH_AR_MAX:
+            rejected.append({"reason": "ar", "bbox": [int(x), int(y), int(x + ww), int(y + hh)], "ar": float(ar)})
+            continue
+
+        fill = float(area) / float(ww * hh)
+        if fill < DASH_FILL_MIN:
+            rejected.append({"reason": "fill", "bbox": [int(x), int(y), int(x + ww), int(y + hh)], "fill": float(fill)})
+            continue
+
+        kept_mask[labels == i] = 255
+        kept.append({
+            "bbox": [int(x), int(y0 + y), int(x + ww), int(y0 + y + hh)],  # FULL coords
+            "cx": int(x + ww // 2),
+            "cy": int(y0 + y + hh // 2),
+            "w": int(ww),
+            "h": int(hh),
+            "fill": float(fill),
+        })
+
+    kept.sort(key=lambda d: (d["cy"], d["cx"]))
+
+    debug = {
+        "y_bounds": [int(y0), int(y1)],
+        "kernels": {
+            "close": [int(k_close), int(k_close)],
+            "long_open": [int(k_ll_w), int(k_ll_h)],
+        },
+        "thresholds": {
+            "min_h": int(min_h),
+            "max_h": int(max_h),
+            "min_w": int(min_w),
+            "max_w": int(max_w),
+            "ar_min": float(DASH_AR_MIN),
+            "ar_max": float(DASH_AR_MAX),
+            "fill_min": float(DASH_FILL_MIN),
+        },
+        "counts": {
+            "components": int(num - 1),
+            "kept": int(len(kept)),
+            "rejected": int(len(rejected)),
+        }
+    }
+
+    return kept, kept_mask, cleaned, long_lines, debug, rejected
+
+
+# =========================
+# DASH CLUSTERING (2 columns)
+# =========================
+
+def cluster_dashes_two_columns(dashes):
     """
     Returns:
-      center_x: center divider x
-      right_x: right border x
+      cols: dict {0: [dash...], 1: [dash...]} ordered by x center (0 = left, 1 = right)
+      centers: (left_center_x, right_center_x)
+      spine_col_index: which column is the "spine" (the left of the two dash columns)
+      rightmost_col_index: which is the right edge dash column
     """
-    h, w = vert.shape[:2]
-    center_x = x_peak(vert, CENTER_BAND[0], CENTER_BAND[1])
-    right_x = x_peak(vert, RIGHT_BAND[0], RIGHT_BAND[1])
+    if len(dashes) == 0:
+        return {0: [], 1: []}, (0.0, 0.0), 0, 1
+    if len(dashes) == 1:
+        # can't kmeans; treat as rightmost for safety
+        return {0: [], 1: [dashes[0]]}, (0.0, float(dashes[0]["cx"])), 0, 1
 
-    # safety: if right_x accidentally equals center_x, push right_x near edge
-    if abs(right_x - center_x) < w * 0.08:
-        right_x = int(w * 0.98)
+    xs = np.array([d["cx"] for d in dashes], dtype=np.float32).reshape(-1, 1)
+    _, labels, centers = cv2.kmeans(
+        xs, 2, None,
+        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1),
+        10, cv2.KMEANS_PP_CENTERS
+    )
 
-    info = {"center_x": int(center_x), "right_x": int(right_x)}
-    return int(center_x), int(right_x), info
+    centers = centers.flatten()
+    order = np.argsort(centers)  # left then right
 
-def y_peaks_from_horiz(horiz_roi: np.ndarray) -> List[int]:
+    cols = {0: [], 1: []}
+    for d, lab in zip(dashes, labels.flatten()):
+        # map actual label to ordered 0/1
+        ordered_col = int(np.where(order == lab)[0][0])
+        cols[ordered_col].append(d)
+
+    cols[0].sort(key=lambda dd: dd["cy"])
+    cols[1].sort(key=lambda dd: dd["cy"])
+
+    left_center = float(centers[order[0]])
+    right_center = float(centers[order[1]])
+    spine_col_index = 0
+    rightmost_col_index = 1
+    return cols, (left_center, right_center), spine_col_index, rightmost_col_index
+
+
+# =========================
+# ROI WIDTH SNAPPING
+# =========================
+
+def _snap_roi_width_to_table(bin_img, y0, y1, x0_coarse, x1_coarse):
     """
-    Detect horizontal-line peaks by y-projection + simple peak picking + clustering.
-    Returns y indices relative to ROI (not absolute).
+    Given fixed row height [y0,y1) and a coarse x band,
+    snap to the printed table's vertical borders inside that band.
+
+    Returns (x0_snap, x1_snap, debug_dict)
     """
-    proj = horiz_roi.sum(axis=1).astype(np.float32)
-    if proj.max() <= 0:
-        return []
+    h, w = bin_img.shape
+    y0 = int(max(0, min(h - 1, y0)))
+    y1 = int(max(y0 + 1, min(h, y1)))
+    x0 = int(max(0, min(w - 1, x0_coarse)))
+    x1 = int(max(x0 + 1, min(w, x1_coarse)))
 
-    proj_norm = proj / (proj.max() + 1e-6)
+    row_h = y1 - y0
+    band_w = x1 - x0
+    if band_w < 10 or row_h < 5:
+        return x0, x1, {"snapped": False, "reason": "tiny_band"}
 
-    peaks = []
-    for y in range(1, len(proj_norm) - 1):
-        if proj_norm[y] >= ROW_PEAK_THRESH and proj_norm[y] >= proj_norm[y - 1] and proj_norm[y] >= proj_norm[y + 1]:
-            peaks.append(y)
+    band = bin_img[y0:y1, x0:x1]
 
-    if not peaks:
-        return []
+    # Emphasize vertical strokes inside this band
+    k_h = max(5, int(row_h * VERT_OPEN_H_FRAC_OF_ROW))
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (VERT_OPEN_W_PX, k_h))
+    vert = cv2.morphologyEx(band, cv2.MORPH_OPEN, k, iterations=1)
 
-    # cluster
-    clustered = [peaks[0]]
-    for p in peaks[1:]:
-        if p - clustered[-1] <= ROW_CLUSTER_TOL_PX:
-            # keep the stronger one
-            if proj_norm[p] > proj_norm[clustered[-1]]:
-                clustered[-1] = p
-        else:
-            clustered.append(p)
+    # X-projection: count of ink pixels per x
+    proj = (vert > 0).sum(axis=0).astype(np.int32)
+    thresh = int(row_h * VERT_PEAK_MIN_FRAC)
 
-    return clustered
+    # Candidate x's where strong vertical line exists
+    cand = np.where(proj >= thresh)[0]
+    if cand.size == 0:
+        return x0, x1, {"snapped": False, "reason": "no_peaks", "thresh": thresh}
 
+    # Choose left border near left edge of band, and right border near right edge of band
+    left_lim = int(band_w * LEFT_BORDER_SEARCH_FRAC)
+    right_lim = int(band_w * (1.0 - RIGHT_BORDER_SEARCH_FRAC))
 
-def merge_spans(spans: List[Tuple[int, int]], max_gap: int) -> List[Tuple[int, int]]:
-    if not spans:
-        return []
-    spans = sorted(spans, key=lambda s: s[0])
-    merged = [list(spans[0])]
-    for a, b in spans[1:]:
-        if a - merged[-1][1] <= max_gap:
-            merged[-1][1] = max(merged[-1][1], b)
-        else:
-            merged.append([a, b])
-    return [(a, b) for a, b in merged]
+    left_cand = cand[cand <= max(1, left_lim)]
+    right_cand = cand[cand >= min(band_w - 2, right_lim)]
 
-
-def merge_boxes_vert(boxes: List[Tuple[int, int, int, int]], max_gap: int) -> List[Tuple[int, int, int, int]]:
-    """
-    Merge rectangles that are vertically touching/close and largely aligned horizontally.
-    """
-    if not boxes:
-        return []
-    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
-    merged: List[List[int]] = [list(boxes[0])]
-    for b in boxes[1:]:
-        last = merged[-1]
-        # vertical proximity + reasonable horizontal overlap
-        if b[1] - last[3] <= max_gap and not (b[2] < last[0] or b[0] > last[2]):
-            last[0] = min(last[0], b[0])
-            last[1] = min(last[1], b[1])
-            last[2] = max(last[2], b[2])
-            last[3] = max(last[3], b[3])
-        else:
-            merged.append(list(b))
-    return [(int(a), int(b), int(c), int(d)) for a, b, c, d in merged]
-
-
-def helper_bar_spans(
-    bin_ink: np.ndarray,
-    col_x0: int,
-    col_x1: int,
-    y0: int,
-    y1: int
-) -> Tuple[List[Tuple[int, int]], Dict, np.ndarray]:
-    """
-    Locate helper bar components inside the right-side band of a column.
-    Returns (spans, debug_info, mask_on_full_image).
-    """
-    h, w = bin_ink.shape[:2]
-    col_x0 = max(0, min(col_x0, w - 1))
-    col_x1 = max(0, min(col_x1, w))
-    y0 = max(0, min(y0, h - 1))
-    y1 = max(0, min(y1, h))
-
-    col = bin_ink[y0:y1, col_x0:col_x1]
-    col_h, col_w = col.shape[:2]
-    band_w = max(8, int(col_w * BAR_BAND_FRAC))
-    band_x0 = max(0, col_w - band_w)
-    band = col[:, band_x0:]
-
-    # Clean minor holes inside the thick bar without merging neighbouring rows
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
-    band_clean = cv2.morphologyEx(band, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    # Focus on the densest vertical slice of the band to isolate the helper bar
-    x_proj = band_clean.sum(axis=0).astype(np.float32)
-    peak_x_rel = int(np.argmax(x_proj)) if x_proj.size else 0
-    core_w = max(max(3, int(col_w * BAR_MIN_W_FRAC)), int(band_w * BAR_CORE_W_FRAC))
-    core_x0 = max(0, min(peak_x_rel - core_w // 2, band_w - core_w))
-    core_x1 = core_x0 + core_w
-
-    core = np.zeros_like(band_clean)
-    core[:, core_x0:core_x1] = band_clean[:, core_x0:core_x1]
-
-    # Close vertically to bridge tiny gaps and ink holes
-    close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, BAR_CLOSE_KH))
-    core_closed = cv2.morphologyEx(core, cv2.MORPH_CLOSE, close_k, iterations=1)
-
-    y_proj = core_closed.sum(axis=1).astype(np.float32)
-    spans: List[Tuple[int, int]] = []
-    kept_components: List[Dict] = []
-
-    if y_proj.size:
-        thr = y_proj.max() * BAR_Y_THRESH_FRAC
-        min_h = max(12, int(col_h * BAR_MIN_H_FRAC))
-
-        in_run = False
-        start = 0
-        for i, v in enumerate(y_proj):
-            if v > thr and not in_run:
-                in_run = True
-                start = i
-            elif v <= thr and in_run:
-                end = i
-                if end - start >= min_h:
-                    spans.append((start + y0, end + y0))
-                in_run = False
-        if in_run:
-            end = len(y_proj) - 1
-            if end - start >= min_h:
-                spans.append((start + y0, end + y0))
-
-        merge_gap = max(6, int((y1 - y0) * BAR_MERGE_GAP_FRAC))
-        spans = merge_spans(spans, merge_gap)
-
-        for sy0, sy1 in spans:
-            h_box = sy1 - sy0
-            area_est = int(y_proj[max(0, sy0 - y0):max(0, sy1 - y0)].sum() / max(1, core_w))
-            kept_components.append(
-                {
-                    "y0": int(sy0),
-                    "y1": int(sy1),
-                    "h": int(h_box),
-                    "w": int(core_w),
-                    "area_est": int(area_est),
-                }
-            )
+    if left_cand.size == 0:
+        left_x = int(cand.min())
     else:
-        merge_gap = max(6, int((y1 - y0) * BAR_MERGE_GAP_FRAC))
+        left_x = int(left_cand.min())
 
-    mask_full = np.zeros_like(bin_ink, dtype=np.uint8)
-    mask_full[y0:y1, col_x0 + band_x0 + core_x0:col_x0 + band_x0 + core_x1] = core_closed[:, core_x0:core_x1]
+    if right_cand.size == 0:
+        right_x = int(cand.max())
+    else:
+        right_x = int(right_cand.max())
 
-    debug = {
-        "band_x0": int(col_x0 + band_x0),
-        "band_w": int(band_w),
-        "core_x0": int(core_x0),
-        "core_w": int(core_w),
-        "peak_x_rel": int(peak_x_rel),
-        "y_threshold": float(y_proj.max() * BAR_Y_THRESH_FRAC) if y_proj.size else 0.0,
-        "merge_gap": int(merge_gap),
-        "candidates": kept_components,
-        "spans": [(int(a), int(b)) for a, b in spans],
+    # Ensure sane ordering and width
+    if right_x <= left_x + 5:
+        return x0, x1, {"snapped": False, "reason": "bad_span", "left_x": left_x, "right_x": right_x}
+
+    x0_snap = x0 + left_x
+    x1_snap = x0 + right_x + 1  # inclusive->exclusive
+
+    return x0_snap, x1_snap, {
+        "snapped": True,
+        "thresh": int(thresh),
+        "band": [int(x0), int(x1)],
+        "picked": [int(x0_snap), int(x1_snap)],
+        "kernel": [int(VERT_OPEN_W_PX), int(k_h)],
+        "left_x_in_band": int(left_x),
+        "right_x_in_band": int(right_x),
     }
-    return spans, debug, mask_full
 
 
-def rect_candidates(
-    bin_ink: np.ndarray, y0: int, y1: int
-) -> Tuple[List[Tuple[int, int, int, int]], Dict, np.ndarray]:
+def build_row_rois_from_dashes(bin_img, dashes, cols, spine_col_index, rightmost_col_index, w_img):
     """
-    Detect rectangular question boxes over the whole sheet.
-    Returns (boxes, debug_info, mask).
+    Build ROIs:
+      - Height is EXACT dash bbox height: y0..y1 = dash bbox
+      - Width:
+          coarse band = constrained per column (won't leak into other column)
+          snap band -> printed table borders via vertical lines
+
+    Returns list of items:
+      {
+        "col": "R" or "L",
+        "dash": dash_dict,
+        "coarse": [x0,y0,x1,y1],
+        "roi": [x0,y0,x1,y1],
+        "snap_debug": {...}
+      }
     """
-    h, w = bin_ink.shape[:2]
-    y0 = max(0, min(y0, h - 1))
-    y1 = max(0, min(y1, h))
-    roi = bin_ink[y0:y1, :]
+    # compute spine column right edge (max x1 of dash bbox in spine col)
+    spine_x_right = None
+    if len(cols.get(spine_col_index, [])) > 0:
+        spine_x_right = int(max(d["bbox"][2] for d in cols[spine_col_index]))
+    else:
+        spine_x_right = int(w_img * 0.5)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, RECT_CLOSE_K)
-    closed = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, kernel, iterations=1)
+    items = []
+    for col_idx, ds in cols.items():
+        # Map to logical label: rightmost dash column => "R" (first reading column)
+        logical = "R" if col_idx == rightmost_col_index else "L"
 
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes: List[Tuple[int, int, int, int]] = []
-    min_w = int(w * RECT_MIN_W_FRAC_IMG)
-    max_w = int(w * RECT_MAX_W_FRAC_IMG)
-    min_h = int(h * RECT_MIN_H_FRAC_IMG)
-    max_h = int(h * RECT_MAX_H_FRAC_IMG)
-    for c in contours:
-        x, y, bw, bh = cv2.boundingRect(c)
-        y_abs = y + y0
-        if bw < min_w or bw > max_w or bh < min_h or bh > max_h:
-            continue
-        aspect = bw / max(bh, 1)
-        if aspect < RECT_ASPECT_MIN or aspect > RECT_ASPECT_MAX:
-            continue
-        boxes.append((x, y_abs, x + bw, y_abs + bh))
+        for d in ds:
+            x0d, y0d, x1d, y1d = d["bbox"]
+            # height is EXACT dash bbox
+            y0 = y0d
+            y1 = y1d
 
-    boxes = merge_boxes_vert(boxes, RECT_Y_MERGE_GAP_PX)
+            # coarse band ends just left of dash
+            x1_coarse = max(0, x0d - DASH_TO_TABLE_GAP_PX)
 
-    mask = np.zeros_like(bin_ink, dtype=np.uint8)
-    for b in boxes:
-        cv2.rectangle(mask, (b[0], b[1]), (b[2], b[3]), 255, 1)
+            if col_idx == rightmost_col_index:
+                # right column: band starts after spine dashes (plus pad)
+                x0_coarse = max(0, spine_x_right + INTER_COL_GAP_PAD_PX)
+            else:
+                # left column: band starts from left page (plus tiny pad)
+                x0_coarse = LEFT_PAGE_PAD_PX
 
-    dbg = {
-        "min_w": int(min_w),
-        "max_w": int(max_w),
-        "min_h": int(min_h),
-        "max_h": int(max_h),
-        "aspect_min": RECT_ASPECT_MIN,
-        "aspect_max": RECT_ASPECT_MAX,
-        "merge_gap_px": RECT_Y_MERGE_GAP_PX,
-        "candidate_count": len(boxes),
-    }
-    return boxes, dbg, mask
+            # clamp coarse width sanity
+            min_w = int(w_img * MIN_ROI_WIDTH_FRAC)
+            max_w = int(w_img * MAX_ROI_WIDTH_FRAC)
+            if x1_coarse - x0_coarse < min_w:
+                # expand left if possible
+                x0_coarse = max(0, x1_coarse - min_w)
+            if x1_coarse - x0_coarse > max_w:
+                x0_coarse = max(0, x1_coarse - max_w)
 
+            # Snap width to table vertical borders inside [x0_coarse, x1_coarse]
+            x0_snap, x1_snap, snap_dbg = _snap_roi_width_to_table(bin_img, y0, y1, x0_coarse, x1_coarse)
 
-def rect_row_spans(
-    bin_ink: np.ndarray,
-    col_x0: int,
-    col_x1: int,
-    y0: int,
-    y1: int,
-    img_w: int,
-    img_h: int,
-) -> Tuple[List[Tuple[int, int, int, int]], Dict, np.ndarray]:
-    """
-    Detect question rows via rectangular contour boxes inside a column ROI.
-    Returns (boxes, debug_info, mask_on_full_image).
-    """
-    h, w = bin_ink.shape[:2]
-    col_x0 = max(0, min(col_x0, w - 1))
-    col_x1 = max(0, min(col_x1, w))
-    y0 = max(0, min(y0, h - 1))
-    y1 = max(0, min(y1, h))
+            # Ensure snapped ROI still respects coarse band constraints
+            x0_snap = max(x0_coarse, x0_snap)
+            x1_snap = min(x1_coarse, x1_snap)
+            if x1_snap <= x0_snap + 5:
+                # fallback to coarse
+                x0_snap, x1_snap = x0_coarse, x1_coarse
+                snap_dbg = {**snap_dbg, "forced_fallback_to_coarse": True}
 
-    roi = bin_ink[y0:y1, col_x0:col_x1]
-    col_w = col_x1 - col_x0
-    min_w = max(10, int(col_w * RECT_MIN_W_FRAC))
-    max_w = int(col_w * RECT_MAX_W_FRAC)
-    min_h = max(8, int(img_h * RECT_MIN_H_FRAC))
-    max_h = int(img_h * RECT_MAX_H_FRAC)
+            items.append({
+                "col": logical,
+                "dash": d,
+                "coarse": [int(x0_coarse), int(y0), int(x1_coarse), int(y1)],
+                "roi": [int(x0_snap), int(y0), int(x1_snap), int(y1)],
+                "snap_debug": snap_dbg,
+            })
 
-    # Slightly close to connect gaps on the rectangle strokes
-    closed = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
-
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cand_boxes: List[Tuple[int, int, int, int]] = []
-    for c in contours:
-        x, y, ww, hh = cv2.boundingRect(c)
-        if ww < min_w or ww > max_w or hh < min_h or hh > max_h:
-            continue
-        aspect = ww / max(hh, 1)
-        if aspect < RECT_ASPECT_MIN or aspect > RECT_ASPECT_MAX:
-            continue
-        # Keep only rectangles that sit well inside the ROI (avoid header line)
-        cand_boxes.append((col_x0 + x, y0 + y, col_x0 + x + ww, y0 + y + hh))
-
-    # Merge vertically-close candidates
-    cand_boxes = sorted(cand_boxes, key=lambda b: (b[1], b[0]))
-    merged: List[Tuple[int, int, int, int]] = []
-    merge_gap = max(4, int(img_h * RECT_MERGE_GAP_FRAC))
-    for b in cand_boxes:
-        if not merged:
-            merged.append(list(b))
-            continue
-        last = merged[-1]
-        if b[1] - last[3] <= merge_gap and abs(b[0] - last[0]) < col_w * 0.15:
-            last[0] = min(last[0], b[0])
-            last[2] = max(last[2], b[2])
-            last[3] = max(last[3], b[3])
-        else:
-            merged.append(list(b))
-
-    merged_boxes = [(int(a), int(b), int(c), int(d)) for a, b, c, d in merged]
-
-    # Build mask for debug
-    mask = np.zeros_like(bin_ink, dtype=np.uint8)
-    for (x0, y0b, x1, y1b) in merged_boxes:
-        cv2.rectangle(mask, (x0, y0b), (x1, y1b), 255, 1)
-
-    debug = {
-        "min_w": int(min_w),
-        "max_w": int(max_w),
-        "min_h": int(min_h),
-        "max_h": int(max_h),
-        "aspect_min": RECT_ASPECT_MIN,
-        "aspect_max": RECT_ASPECT_MAX,
-        "merge_gap": int(merge_gap),
-        "candidates": [list(map(int, b)) for b in cand_boxes],
-        "merged": [list(map(int, b)) for b in merged_boxes],
-    }
-    return merged_boxes, debug, mask
-
-def build_row_boxes(
-    horiz: np.ndarray,
-    col_x0: int,
-    col_x1: int,
-    y0: int,
-    y1: int,
-    img_w: int,
-    img_h: int
-) -> List[Tuple[int, int, int, int]]:
-    """
-    Build row boxes within [y0,y1) using horizontal line peaks.
-    """
-    col_x0 = max(0, min(col_x0, img_w - 1))
-    col_x1 = max(0, min(col_x1, img_w))
-    y0 = max(0, min(y0, img_h - 1))
-    y1 = max(0, min(y1, img_h))
-
-    roi = horiz[y0:y1, col_x0:col_x1]
-    peaks = y_peaks_from_horiz(roi)
-
-    # Need boundaries: include top and bottom
-    boundaries = [0] + peaks + [roi.shape[0] - 1]
-    boundaries = sorted(set(boundaries))
-
-    boxes: List[Tuple[int, int, int, int]] = []
-    min_h = int(img_h * MIN_ROW_H_FRAC)
-
-    for i in range(len(boundaries) - 1):
-        yy0 = boundaries[i]
-        yy1 = boundaries[i + 1]
-        if yy1 - yy0 < min_h:
-            continue
-        # inset a bit to avoid slicing on the line itself
-        inset_y = int((yy1 - yy0) * ROW_INSET_Y_FRAC)
-        inset_x = int((col_x1 - col_x0) * ROW_INSET_X_FRAC)
-
-        ax0 = col_x0 + inset_x
-        ax1 = col_x1 - inset_x
-        ay0 = y0 + yy0 + inset_y
-        ay1 = y0 + yy1 - inset_y
-
-        if ay1 > ay0 and ax1 > ax0:
-            boxes.append((ax0, ay0, ax1, ay1))
-
-    return boxes
+    return items
 
 
-def boxes_from_spans(
-    spans: List[Tuple[int, int]],
-    col_x0: int,
-    col_x1: int,
-    img_w: int,
-    img_h: int,
-) -> List[Tuple[int, int, int, int]]:
-    col_x0 = max(0, min(col_x0, img_w - 1))
-    col_x1 = max(0, min(col_x1, img_w))
-    boxes: List[Tuple[int, int, int, int]] = []
-    min_h = int(img_h * MIN_ROW_H_FRAC)
+# =========================
+# DEBUG DRAWING
+# =========================
 
-    for y0, y1 in spans:
-        y0 = max(0, min(y0, img_h - 1))
-        y1 = max(0, min(y1, img_h))
-        if y1 - y0 < min_h:
-            continue
-        inset_y = int((y1 - y0) * ROW_INSET_Y_FRAC)
-        inset_x = int((col_x1 - col_x0) * ROW_INSET_X_FRAC)
+def draw_dashes_overlay(img_bgr, y0, y1, kept, rejected):
+    overlay = img_bgr.copy()
+    cv2.rectangle(overlay, (0, y0), (overlay.shape[1] - 1, y1), (0, 255, 255), 2)  # ROI bounds
 
-        ay0 = y0 + inset_y
-        ay1 = y1 - inset_y
-        ax0 = col_x0 + inset_x
-        ax1 = col_x1 - inset_x
+    for d in kept:
+        x0, yy0, x1, yy1 = d["bbox"]
+        cv2.rectangle(overlay, (x0, yy0), (x1, yy1), (0, 255, 0), 2)  # kept dashes
 
-        if ay1 > ay0 and ax1 > ax0:
-            boxes.append((ax0, ay0, ax1, ay1))
-    return boxes
+    for r in rejected[:200]:
+        x0, yy0, x1, yy1 = r["bbox"]
+        cv2.rectangle(overlay, (x0, y0 + yy0), (x1, y0 + yy1), (0, 0, 255), 1)
+
+    return overlay
 
 
-def cluster_columns_from_boxes(boxes: List[Tuple[int, int, int, int]], img_w: int) -> Tuple[List[int], Dict]:
-    """
-    Cluster candidate rectangles into two columns based on x-center using k-means (k=2).
-    Returns labels per box and debug info.
-    """
-    if not boxes:
-        return [], {"labels": [], "centers": []}
+def draw_dashes_and_rois_overlay(img_bgr, items, split_x=None):
+    overlay = img_bgr.copy()
 
-    pts = np.float32([[ (b[0] + b[2]) * 0.5 ] for b in boxes])
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.2)
-    compactness, labels, centers = cv2.kmeans(pts, 2, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
-    labels = labels.flatten().tolist()
-    centers = centers.flatten().tolist()
-    # sort so column 0 = left
-    if centers[0] > centers[1]:
-        centers = centers[::-1]
-        labels = [1 - l for l in labels]
+    # optional split line (purely visual)
+    if split_x is not None:
+        cv2.line(overlay, (int(split_x), 0), (int(split_x), overlay.shape[0] - 1), (0, 255, 0), 2)
 
-    dbg = {"compactness": float(compactness), "centers": [float(c) for c in centers], "labels": labels}
-    return labels, dbg
+    for it in items:
+        # coarse band = purple
+        x0, y0, x1, y1 = it["coarse"]
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 0, 255), 2)
 
+        # snapped ROI = cyan
+        x0, y0, x1, y1 = it["roi"]
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 255, 0), 2)
 
-def filter_and_sort_boxes_by_column(
-    boxes: List[Tuple[int, int, int, int]],
-    labels: List[int],
-    col_idx: int,
-    header_y: int,
-    img_h: int,
-) -> List[Tuple[int, int, int, int]]:
-    col_boxes = [b for b, l in zip(boxes, labels) if l == col_idx and b[1] >= header_y]
-    col_boxes.sort(key=lambda b: b[1])
-    # drop duplicates/overlaps too close vertically
-    cleaned: List[Tuple[int, int, int, int]] = []
-    min_gap = max(4, int(img_h * 0.004))
-    for b in col_boxes:
-        if cleaned and b[1] - cleaned[-1][1] < min_gap and b[3] - cleaned[-1][3] < min_gap:
-            continue
-        cleaned.append(b)
-    return cleaned
+        # dash bbox = green
+        dx0, dy0, dx1, dy1 = it["dash"]["bbox"]
+        cv2.rectangle(overlay, (dx0, dy0), (dx1, dy1), (0, 255, 0), 2)
+
+    return overlay
 
 
-def detect_rows_for_column(
-    bin_ink: np.ndarray,
-    horiz: np.ndarray,
-    col_bounds: Tuple[int, int],
-    y0: int,
-    y1: int,
-    img_w: int,
-    img_h: int,
-    rect_boxes: List[Tuple[int, int, int, int]],
-    rect_labels: List[int],
-    col_idx: int,
-) -> Tuple[List[Tuple[int, int, int, int]], Dict, np.ndarray]:
-    """
-    Detect row boxes for a single column given precomputed rectangle candidates + labels.
-    Falls back to helper bar spans, then horizontal lines.
-    """
-    rect_in_col = filter_and_sort_boxes_by_column(rect_boxes, rect_labels, col_idx, y0, img_h)
-    rect_mask = np.zeros_like(bin_ink, dtype=np.uint8)
-    for b in rect_in_col:
-        cv2.rectangle(rect_mask, (b[0], b[1]), (b[2], b[3]), 255, 1)
+# =========================
+# MAIN
+# =========================
 
-    if len(rect_in_col) >= RECT_MIN_PER_COL:
-        info = {
-            "method": "rectangles",
-            "rect_debug": {"selected": [list(map(int, b)) for b in rect_in_col]},
-            "count": len(rect_in_col),
-        }
-        return rect_in_col, info, rect_mask
-
-    spans, bar_dbg, bar_mask = helper_bar_spans(bin_ink, col_bounds[0], col_bounds[1], y0, y1)
-    if spans:
-        boxes = boxes_from_spans(spans, col_bounds[0], col_bounds[1], img_w, img_h)
-        info = {
-            "method": "helper_bar",
-            "bar_debug": bar_dbg,
-            "count": len(boxes),
-        }
-        return boxes, info, bar_mask
-
-    boxes = build_row_boxes(horiz, col_bounds[0], col_bounds[1], y0, y1 - 1, img_w, img_h)
-    info = {
-        "method": "horizontal_fallback",
-        "count": len(boxes),
-        "fallback": {
-            "row_peak_thresh": ROW_PEAK_THRESH,
-            "row_cluster_tol_px": ROW_CLUSTER_TOL_PX,
-            "min_row_h_frac": MIN_ROW_H_FRAC,
-        },
-    }
-    return boxes, info, np.zeros_like(bin_ink, dtype=np.uint8)
-
-def crop_row(img: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
-    x0, y0, x1, y1 = box
-    h, w = img.shape[:2]
-    x0, y0 = max(0, x0), max(0, y0)
-    x1, y1 = min(w, x1), min(h, y1)
-    if x1 <= x0 or y1 <= y0:
-        return img[0:0, 0:0]
-    row = img[y0:y1, x0:x1]
-
-    # remove number strip (on the RIGHT side inside each row)
-    strip = int(row.shape[1] * NUMBER_STRIP_FRAC)
-    if row.shape[1] - strip > 5:
-        row = row[:, : row.shape[1] - strip]
-    return row
-
-
-# -------------------------
-# Main
-# -------------------------
-
-def slice_sheet(image_path: Path, out_root: Path):
+def run(image_path: Path, out_root: Path):
     img = cv2.imread(str(image_path))
     if img is None:
-        raise RuntimeError(f"Failed to read image: {image_path}")
+        raise RuntimeError(f"Failed to load image: {image_path}")
 
-    h, w = img.shape[:2]
-    gray = to_gray(img)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
 
-    stem = image_path.stem.replace("_crop", "")
+    stem = image_path.stem
     out_dir = out_root / stem
-    out_q = out_dir / "questions"
-    out_d = out_dir / "debug"
-    out_q.mkdir(parents=True, exist_ok=True)
-    out_d.mkdir(parents=True, exist_ok=True)
+    q_dir = out_dir / "questions"
+    d_dir = out_dir / "debug"
+    q_dir.mkdir(parents=True, exist_ok=True)
+    d_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Binarize with auto polarity
-    bin_ink, bin_info = binarize_auto(gray)
-    write_png(out_d / "01_gray.png", gray)
-    write_png(out_d / "02_bin_ink.png", bin_ink)
+    # Binarize
+    bin_img, bin_info = adaptive_binarize(gray)
 
-    # 2) Extract vertical + horizontal structure
-    vert = morph_vertical(bin_ink)
-    horiz = morph_horizontal(bin_ink)
-    write_png(out_d / "03_vert.png", vert)
-    write_png(out_d / "04_horiz.png", horiz)
+    # ROI bounds for detection
+    y0 = int(h * TOP_IGNORE_FRAC)
+    y1 = int(h * (1.0 - BOTTOM_IGNORE_FRAC))
 
-    # 3) Find global separators: center divider + right border
-    center_x, right_x, sep_info = find_two_separators(vert)
+    # Detect dashes
+    kept, kept_mask_roi, cleaned_roi, long_lines_roi, dash_debug, rejected = detect_dashes(bin_img, y0, y1)
 
-    # 4) Define columns + table vertical span (simple: from just below header line)
-    # Header line: strongest horizontal line in top 65%
-    top_band = horiz[: int(h * 0.65), :]
-    yproj = top_band.sum(axis=1).astype(np.float32)
-    header_y = int(np.argmax(yproj)) if yproj.size else int(h * 0.12)
-    header_y = min(h - 2, max(0, header_y + 2))
+    # Cluster into 2 dash columns (spine + right edge)
+    cols, centers, spine_col_index, rightmost_col_index = cluster_dashes_two_columns(kept)
 
-    margin = int(w * PAGE_MARGIN_FRAC)
-    sep_pad = int(w * SEP_PAD_FRAC)
-    rb_pad = int(w * RIGHT_BORDER_PAD_FRAC)
+    # (optional) visual split line between dash columns for debug
+    # We choose midpoint between the two dash-column centers if available.
+    split_x = None
+    if centers[0] > 0 and centers[1] > 0:
+        split_x = int((centers[0] + centers[1]) * 0.5)
 
-    colL = (margin, max(margin + 10, center_x - sep_pad))
-    colR = (min(w - margin - 10, center_x + sep_pad), max(center_x + sep_pad + 10, right_x - rb_pad))
+    # Build row ROIs from dashes (height = dash bbox, width snapped to table borders)
+    items = build_row_rois_from_dashes(bin_img, kept, cols, spine_col_index, rightmost_col_index, w)
 
-    # 5) Rectangle candidates across the page + column clustering
-    rect_boxes, rect_dbg, rect_mask = rect_candidates(bin_ink, header_y, h - 1)
-    rect_labels, cluster_dbg = cluster_columns_from_boxes(rect_boxes, w)
+    # Ordering + naming:
+    # Right column first (top->bottom), then left column (top->bottom), global numbering from 1.
+    right_items = [it for it in items if it["col"] == "R"]
+    left_items = [it for it in items if it["col"] == "L"]
+    right_items.sort(key=lambda it: it["dash"]["cy"])
+    left_items.sort(key=lambda it: it["dash"]["cy"])
 
-    # 6) Row boxes per column (rectangles preferred, helper/horiz fallback)
-    rows_L, info_L, mask_L = detect_rows_for_column(
-        bin_ink, horiz, colL, header_y, h - 1, w, h, rect_boxes, rect_labels, 0
-    )
-    rows_R, info_R, mask_R = detect_rows_for_column(
-        bin_ink, horiz, colR, header_y, h - 1, w, h, rect_boxes, rect_labels, 1
-    )
+    ordered = right_items + left_items if RIGHT_COLUMN_IS_FIRST else left_items + right_items
 
-    # 6) Export crops
-    exported = {"colL": [], "colR": []}
-    for i, box in enumerate(rows_L):
-        crop = crop_row(img, box)
-        if crop.size:
-            name = f"colL_row_{i:03d}.png"
-            cv2.imwrite(str(out_q / name), crop, [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION])
-            exported["colL"].append({"i": i, "box": list(map(int, box)), "file": name})
+    exported = []
+    q_index = 1
+    for it in ordered:
+        x0r, y0r, x1r, y1r = it["roi"]
+        crop = img[y0r:y1r, x0r:x1r]
+        if crop.size == 0:
+            continue
 
-    for i, box in enumerate(rows_R):
-        crop = crop_row(img, box)
-        if crop.size:
-            name = f"colR_row_{i:03d}.png"
-            cv2.imwrite(str(out_q / name), crop, [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION])
-            exported["colR"].append({"i": i, "box": list(map(int, box)), "file": name})
+        col = it["col"]
+        name = f"Q{q_index}-Col-{col}.png"
+        cv2.imwrite(str(q_dir / name), crop, [cv2.IMWRITE_PNG_COMPRESSION, 3])
 
-    # 7) Debug overlay and helper mask
-    overlay = img.copy()
-    cv2.line(overlay, (center_x, 0), (center_x, h - 1), (0, 255, 0), 2)
-    cv2.line(overlay, (right_x, 0), (right_x, h - 1), (0, 200, 255), 2)
-    cv2.line(overlay, (0, header_y), (w - 1, header_y), (0, 0, 255), 2)
-    cv2.rectangle(overlay, (colL[0], header_y), (colL[1], h - 2), (255, 0, 0), 2)
-    cv2.rectangle(overlay, (colR[0], header_y), (colR[1], h - 2), (255, 0, 0), 2)
+        exported.append({
+            "q": int(q_index),
+            "col": col,
+            "file": name,
+            "roi": [int(x0r), int(y0r), int(x1r), int(y1r)],
+            "coarse": it["coarse"],
+            "dash": it["dash"]["bbox"],
+            "snap_debug": it["snap_debug"],
+        })
+        q_index += 1
 
-    if info_L["method"] == "helper_bar":
-        for y0, y1 in info_L["bar_debug"]["spans"]:
-            cv2.rectangle(overlay, (info_L["bar_debug"]["band_x0"], y0), (colL[1] - 1, y1), (0, 140, 255), 1)
-    if info_L["method"] == "rectangles":
-        for x0, y0, x1, y1 in info_L["rect_debug"]["selected"]:
-            cv2.rectangle(overlay, (x0, y0), (x1, y1), (120, 200, 255), 1)
-    for b in rows_L:
-        cv2.rectangle(overlay, (b[0], b[1]), (b[2], b[3]), (255, 0, 255), 1)
-    if info_R["method"] == "helper_bar":
-        for y0, y1 in info_R["bar_debug"]["spans"]:
-            cv2.rectangle(overlay, (info_R["bar_debug"]["band_x0"], y0), (colR[1] - 1, y1), (0, 255, 140), 1)
-    if info_R["method"] == "rectangles":
-        for x0, y0, x1, y1 in info_R["rect_debug"]["selected"]:
-            cv2.rectangle(overlay, (x0, y0), (x1, y1), (120, 255, 200), 1)
-    for b in rows_R:
-        cv2.rectangle(overlay, (b[0], b[1]), (b[2], b[3]), (0, 255, 255), 1)
+    # Build full-size masks for easier viewing
+    kept_mask_full = np.zeros((h, w), dtype=np.uint8)
+    kept_mask_full[y0:y1, :] = kept_mask_roi
 
-    write_png(out_d / "05_overlay.png", overlay)
-    helper_mask = cv2.bitwise_or(mask_L, mask_R)
-    write_png(out_d / "06_helper_bars.png", helper_mask)
-    write_png(out_d / "07_rect_candidates.png", rect_mask)
+    cleaned_full = np.zeros((h, w), dtype=np.uint8)
+    cleaned_full[y0:y1, :] = cleaned_roi
 
-    # 8) Save JSON debug
-    dbg = {
-        "image": {"w": w, "h": h},
-        "binarize": bin_info,
-        "separators": {"center_x": center_x, "right_x": right_x, "header_y": header_y},
-        "columns": {"L": list(map(int, colL)), "R": list(map(int, colR))},
-        "counts": {"rows_L": len(rows_L), "rows_R": len(rows_R)},
-        "row_detection": {
-            "rect_candidates": rect_dbg,
-            "cluster": cluster_dbg,
-            "L": info_L,
-            "R": info_R,
+    long_full = np.zeros((h, w), dtype=np.uint8)
+    long_full[y0:y1, :] = long_lines_roi
+
+    # Debug overlays
+    dashes_overlay = draw_dashes_overlay(img, y0, y1, kept, rejected)
+    dashes_and_rois_overlay = draw_dashes_and_rois_overlay(img, ordered, split_x=split_x)
+
+    # Save SMALL debug images
+    def save_small(path: Path, im, is_jpg: bool):
+        small = cv2.resize(im, None, fx=DEBUG_SCALE, fy=DEBUG_SCALE, interpolation=cv2.INTER_AREA if im.ndim == 3 else cv2.INTER_NEAREST)
+        if is_jpg:
+            cv2.imwrite(str(path), small, [cv2.IMWRITE_JPEG_QUALITY, JPG_QUALITY])
+        else:
+            cv2.imwrite(str(path), small, [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION])
+
+    save_small(d_dir / "dashes_overlay_small.jpg", dashes_overlay, True)
+    save_small(d_dir / "dashes_and_rois_overlay_small.jpg", dashes_and_rois_overlay, True)
+    save_small(d_dir / "dash_mask_small.png", kept_mask_full, False)
+    save_small(d_dir / "cleaned_small.png", cleaned_full, False)
+    save_small(d_dir / "long_lines_small.png", long_full, False)
+
+    # JSON
+    data = {
+        "image": {"w": int(w), "h": int(h)},
+        "binarization": bin_info,
+        "table_bounds": {"y0": int(y0), "y1": int(y1)},
+        "dash_detection": dash_debug,
+        "dash_columns": {
+            "centers_x": [float(centers[0]), float(centers[1])],
+            "spine_col_index": int(spine_col_index),
+            "rightmost_col_index": int(rightmost_col_index),
+            "counts": {"col0": int(len(cols[0])), "col1": int(len(cols[1]))},
+            "right_column_is_first": bool(RIGHT_COLUMN_IS_FIRST),
         },
         "exported": exported,
-        "tuning_hints": {
-            "If 02_bin_ink looks flooded (too white)": [
-                "increase ADAPTIVE_C (e.g. 10..15)",
-                "increase ADAPTIVE_BLOCK_FRAC (e.g. 0.03)",
-                "or lower FG_RATIO_MAX slightly (e.g. 0.15) so polarity flips earlier",
-            ],
-            "If row splitting misses lines": [
-                "lower ROW_PEAK_THRESH (e.g. 0.25)",
-                "increase HORIZ_KERNEL_W_FRAC (e.g. 0.22)",
-            ],
-            "If center/right separators are off": [
-                "increase VERT_KERNEL_H_FRAC (e.g. 0.25)",
-                "adjust CENTER_BAND/RIGHT_BAND",
-            ],
+        "outputs": {
+            "dashes_overlay": "debug/dashes_overlay_small.jpg",
+            "dashes_and_rois_overlay": "debug/dashes_and_rois_overlay_small.jpg",
+            "dash_mask": "debug/dash_mask_small.png",
+            "cleaned": "debug/cleaned_small.png",
+            "long_lines": "debug/long_lines_small.png",
+            "questions_dir": "questions/",
         },
     }
-    (out_d / "data.json").write_text(json.dumps(dbg, indent=2), encoding="utf-8")
+    (out_dir / "data.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def main():
@@ -815,7 +619,7 @@ def main():
     ap.add_argument("--image", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     args = ap.parse_args()
-    slice_sheet(args.image, args.out)
+    run(args.image, args.out)
 
 
 if __name__ == "__main__":

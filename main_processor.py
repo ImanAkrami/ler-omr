@@ -54,7 +54,7 @@ def process_single_file(image_path: Path, input_dir: Path, output_dir: Path, deb
         sheet_stem = image_path.stem
         questions_output_root = Path("output") / "questions"
 
-        slice_questions.slice_sheet(crop_path, questions_output_root)
+        slice_questions.run(crop_path, questions_output_root)
 
         return {
             "image": image_path.name,
