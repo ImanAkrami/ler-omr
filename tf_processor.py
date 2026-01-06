@@ -205,8 +205,8 @@ def process(
             cv2.LINE_AA,
         )
 
-        img_p = debug_dir / f"stage3_tf_Q{question_number}_debug.jpg"
-        json_p = debug_dir / f"stage3_tf_Q{question_number}_debug.json"
+        img_p = debug_dir / f"stage3_Q{question_number:03d}_tf_debug.jpg"
+        json_p = debug_dir / f"stage3_Q{question_number:03d}_tf_debug.json"
 
         cv2.imwrite(str(img_p), vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
         json_p.write_text(json.dumps({

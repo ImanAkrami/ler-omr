@@ -53,14 +53,9 @@ def process_all_questions(
     q_dir = file_output_dir / "questions"
     q_dir.mkdir(parents=True, exist_ok=True)
 
-    # Stage 3 debug directories
+    # Stage 3 debug directory (all types in same folder)
     stage3_debug_dir = file_output_dir / "debug" / "stage3"
-    stage3_mcq_debug_dir = stage3_debug_dir / "mcq"
-    stage3_tf_debug_dir = stage3_debug_dir / "tf"
-    stage3_desc_debug_dir = stage3_debug_dir / "desc"
-    stage3_mcq_debug_dir.mkdir(parents=True, exist_ok=True)
-    stage3_tf_debug_dir.mkdir(parents=True, exist_ok=True)
-    stage3_desc_debug_dir.mkdir(parents=True, exist_ok=True)
+    stage3_debug_dir.mkdir(parents=True, exist_ok=True)
 
     processed_results: List[Dict] = []
     mcq_summary: List[Dict] = []
@@ -78,15 +73,8 @@ def process_all_questions(
         if question_type is None:
             continue
 
-        # Route debug_dir by type
-        debug_dir = None
-        question_type_upper = str(question_type).upper()
-        if question_type_upper == "MCQ":
-            debug_dir = stage3_mcq_debug_dir
-        elif question_type_upper == "TF":
-            debug_dir = stage3_tf_debug_dir
-        elif question_type_upper == "DESC":
-            debug_dir = stage3_desc_debug_dir
+        # All types use the same debug directory
+        debug_dir = stage3_debug_dir
 
         processing_result = process_question_crop(
             crop,
@@ -127,6 +115,6 @@ def process_all_questions(
 
     # Uploadable MCQ summary
     if mcq_summary:
-        (stage3_mcq_debug_dir / "stage3_mcq_summary.json").write_text(json.dumps(mcq_summary, indent=2), encoding="utf-8")
+        (stage3_debug_dir / "stage3_mcq_summary.json").write_text(json.dumps(mcq_summary, indent=2), encoding="utf-8")
 
     return processed_results

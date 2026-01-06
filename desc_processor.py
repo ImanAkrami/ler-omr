@@ -80,8 +80,8 @@ def process(
     if debug_dir:
         debug_dir.mkdir(parents=True, exist_ok=True)
 
-        img_path = debug_dir / f"stage3_desc_Q{question_number}_crop.png"
-        json_path = debug_dir / f"stage3_desc_Q{question_number}_debug.json"
+        img_path = debug_dir / f"stage3_Q{question_number:03d}_desc_crop.png"
+        json_path = debug_dir / f"stage3_Q{question_number:03d}_desc_debug.json"
 
         cv2.imwrite(str(img_path), img)
 

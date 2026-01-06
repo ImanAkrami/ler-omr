@@ -324,8 +324,8 @@ def process(
     debug_paths: Dict[str, str] = {}
     if debug_dir:
         debug_dir.mkdir(parents=True, exist_ok=True)
-        img_p = debug_dir / f"stage3_mcq_Q{question_number}_debug.jpg"
-        json_p = debug_dir / f"stage3_mcq_Q{question_number}_debug.json"
+        img_p = debug_dir / f"stage3_Q{question_number:03d}_mcq_debug.jpg"
+        json_p = debug_dir / f"stage3_Q{question_number:03d}_mcq_debug.json"
 
         cv2.imwrite(str(img_p), vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
         json_p.write_text(json.dumps({
